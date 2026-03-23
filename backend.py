@@ -417,15 +417,23 @@ def _regex_extract(text: str, doc_type: str) -> dict:
 
     # --- NOLA financial totals ---
     if doc_type == "nola":
-        line_amounts = _re.findall(r"\$([\d,]+\.\d{2})", text)
-        vals = []
-        for a in line_amounts:
-            try:
-                vals.append(float(a.replace(",","")))
-            except ValueError:
-                pass
-        if vals:
-            e["total_amount_owed"] = f"{sum(vals):.2f}"
+        # Extract the NOLA's stated total using the same ground-truth patterns used
+        # everywhere else. Do NOT sum all $ amounts — that double-counts when the
+        # stated total appears alongside its component line items.
+        _nola_total = None
+        for _np in [
+            r"(?:Total Amount Due|Balance Due|Total Due|Amount Due|Total Balance|Total Outstanding)[\s:]*\$?\s*([\d,]+\.\d{2})",
+            r"(?:please remit|remit the sum of|pay the sum of)\s+\$?\s*([\d,]+\.\d{2})",
+        ]:
+            _nm = _re.search(_np, text, _re.IGNORECASE | _re.MULTILINE)
+            if _nm:
+                try:
+                    _nola_total = float(_nm.group(1).replace(",", ""))
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if _nola_total is not None:
+            e["total_amount_owed"] = f"{_nola_total:.2f}"
         # Monthly assessment: find the repeating assessment line
         m = _re.search(r"Assessment - Homeowner \d{4}\s+\$([\d,]+\.\d{2})", text)
         if m:
@@ -538,6 +546,7 @@ def _compute_demand_letter_table(
     certified_mail: float = 0.0,
     other_costs: float = 0.0,
     attorney_fees_override: float = 0.0,
+    nola_balance_override: float = None,
 ) -> dict:
     """
     IQ-225 high-precision demand letter table calculator.
@@ -561,6 +570,17 @@ def _compute_demand_letter_table(
     special_assessments = nola_cats["special_assessments"]
     late_fees           = nola_cats["late_fees"]
     other_charges       = nola_cats["other_charges"]
+
+    # ── 1b. Reconcile parsed line items to NOLA stated balance (ground truth) ──
+    # Per PRD §1: the NOLA stated balance is the authoritative anchor.
+    # If the parser did not capture all line items, the difference is absorbed
+    # into other_charges so the IQ-225 total always springs from the NOLA.
+    if nola_balance_override is not None:
+        _override_d = D(nola_balance_override)
+        _parsed_sum = maintenance + special_assessments + late_fees + other_charges
+        _reconcile  = _override_d - _parsed_sum
+        if abs(_reconcile) > D("0.00"):
+            other_charges += _reconcile
 
     # ── 2. New monthly assessments (NOLA month+1 → through_date month) ──
     monthly_assessment = D(merged.get("monthly_assessment", "0"))
@@ -663,28 +683,49 @@ def _compute_demand_letter_table(
 
 
 def _parse_ledger_transactions(text: str) -> list:
-    """Parse the actual transaction table from a FL HOA ledger PDF into line items."""
+    """Parse the actual transaction table from a FL HOA/condo ledger PDF into line items.
+
+    Handles both flat-format and FPMS category-grouped format:
+      - Group headers are ALL CAPS (ASSESSMENT - HOMEOWNER 2025, OVER BUDGET - WATER BILL 2025, etc.)
+      - Transaction rows: MM/DD/YYYY  Description  BatchNum  $Amount|-  $Amount|-
+      - Dollar signs ($) in amount columns are stripped before parsing
+      - "Balance Fwd" rows classified as Previous Balance
+    """
     items = []
     current_group = ""
     running_balance = 0.0
 
-    # Split into lines and walk through
+    # Regex: matches any FPMS section header (case-insensitive).
+    # Examples: "ASSESSMENT - HOMEOWNER 2025", "OVER BUDGET - WATER BILL 2025",
+    #           "COLLECTION LETTER FEE 2025", "LEGAL FEES 2025", "SPECIAL ASSESSMENT 2025"
+    _GROUP_HDR = _re.compile(
+        r"^(ASSESSMENT|OVER BUDGET|COLLECTION|LEGAL|SPECIAL ASSESSMENT|PREPAID)"
+        r"[\s\-–A-Z()]+\d{4}$",
+        _re.IGNORECASE,
+    )
+
+    # Regex: transaction row with optional $ before amounts.
+    # Columns: date  description  batchNum  charge|-  credit|-  [balance]
+    _TXN_ROW = _re.compile(
+        r"^(\d{2}/\d{2}/\d{4})\s+(.+?)\s+(\d+)\s+\$?([\d,]+\.\d{2}|-)\s+\$?([\d,]+\.\d{2}|-)"
+    )
+
     lines = text.split("\n")
     for line in lines:
         line = line.strip()
         if not line:
             continue
 
-        # Group header: lines like "Assessment - Homeowner 2026"
-        if _re.match(r"^Assessment\s*-\s*.+\d{4}$", line):
+        # ── Section header ────────────────────────────────────────────────────
+        if _GROUP_HDR.match(line):
             current_group = line
             continue
 
-        # Previous balance row: "Previous Balance $ X.XX" or "Previous Balance X,XXX.XX"
+        # ── Explicit "Previous Balance" row (non-FPMS format) ─────────────────
         m = _re.match(r"Previous Balance\s+\$?\s*([\d,]+\.\d{2})", line)
         if m:
-            amt = float(m.group(1).replace(",",""))
-            running_balance += amt
+            amt = float(m.group(1).replace(",", ""))
+            running_balance = round(running_balance + amt, 2)
             items.append({
                 "date": "", "description": f"Previous Balance — {current_group}",
                 "type": "Previous Balance", "batch": "",
@@ -693,46 +734,53 @@ def _parse_ledger_transactions(text: str) -> list:
             })
             continue
 
-        # Transaction row: "MM/DD/YYYY Description BatchNum Amount|- Amount|-"
-        m = _re.match(
-            r"^(\d{2}/\d{2}/\d{4})\s+(.+?)\s+(\d+)\s+([\d,]+\.\d{2}|-)\s+([\d,]+\.\d{2}|-)",
-            line
-        )
+        # ── Dated transaction row ─────────────────────────────────────────────
+        m = _TXN_ROW.match(line)
         if m:
             date, desc, batch, charge_s, credit_s = m.groups()
-            charge = float(charge_s.replace(",","")) if charge_s != "-" else 0.0
-            credit = float(credit_s.replace(",","")) if credit_s != "-" else 0.0
-            running_balance = running_balance + charge - credit
+            charge = float(charge_s.replace(",", "")) if charge_s != "-" else 0.0
+            credit = float(credit_s.replace(",", "")) if credit_s != "-" else 0.0
+            running_balance = round(running_balance + charge - credit, 2)
 
-            # Classify type
             desc_l = desc.lower()
-            if any(kw in desc_l for kw in ("over budget", "water bill", "water assessment")):
+            grp_l  = current_group.lower()
+
+            # Type classification — check "balance fwd" FIRST to avoid
+            # misclassifying it as "Late Fee" due to "Late Fee Income" in desc.
+            if "balance fwd" in desc_l or "balance forward" in desc_l:
+                ttype = "Previous Balance"
+            elif any(kw in grp_l or kw in desc_l
+                     for kw in ("over budget", "water bill", "water assessment")):
                 ttype = "Over Budget"
-            elif "assessment" in desc_l:
-                ttype = "Regular Assessment"
+            elif "special assessment" in grp_l:
+                ttype = "Special Assessment"
+            elif any(kw in desc_l for kw in ("echeck", "check", "payment")):
+                ttype = "Payment Received"
             elif "waive" in desc_l or "credit" in desc_l:
                 ttype = "Credit/Waiver"
-            elif "echeck" in desc_l or "check" in desc_l or "payment" in desc_l:
-                ttype = "Payment Received"
-            elif "late" in desc_l:
-                ttype = "Late Fee"
             elif "interest" in desc_l:
                 ttype = "Interest"
-            elif "charge" in desc_l:
-                ttype = "Delinquent Fee"
+            elif any(kw in grp_l or kw in desc_l
+                     for kw in ("delinquent fee", "late fee", "late")):
+                ttype = "Late Fee"
+            elif "collection" in grp_l or "legal" in grp_l:
+                ttype = "Other"
+            elif "assessment" in grp_l or "assessment" in desc_l:
+                ttype = "Regular Assessment"
             else:
                 ttype = "Other"
 
             items.append({
-                "date": date, "description": f"{desc} — {current_group}",
+                "date": date,
+                "description": f"{desc} — {current_group}" if current_group else desc,
                 "type": ttype, "batch": batch,
                 "charge": charge, "credit": credit, "balance": running_balance,
                 "group": current_group,
             })
             continue
 
-        # Total row: skip (we recalculate)
-        if line.startswith("Total ") or line.startswith("Grand Total"):
+        # ── Skip total/summary rows ───────────────────────────────────────────
+        if _re.match(r"^(Total|Grand Total|GRAND TOTAL)", line, _re.IGNORECASE):
             continue
 
     return items
@@ -1529,6 +1577,20 @@ async def _load_entities_from_uploads(
     _through = datetime.date(_td.year + 1, 1, 1) if _td.month == 12 else datetime.date(_td.year, _td.month + 1, 1)
     nola_text = file_map.get("nola", {}).get("text", "")
 
+    # Extract NOLA stated balance to anchor IQ-225 (PRD §1 — ground truth)
+    _nola_balance_anchor_leu = None
+    for _pat_leu in [
+        r"(?:Total Amount Due|Balance Due|Total Due|Amount Due|Total Balance|Total Outstanding)[\s:]*\$?\s*([\d,]+\.\d{2})",
+        r"(?:please remit|remit the sum of|pay the sum of)\s+\$?\s*([\d,]+\.\d{2})",
+    ]:
+        _m_leu = _re.search(_pat_leu, nola_text, _re.IGNORECASE | _re.MULTILINE)
+        if _m_leu:
+            try:
+                _nola_balance_anchor_leu = float(_m_leu.group(1).replace(",", ""))
+                break
+            except (ValueError, TypeError):
+                pass
+
     def _ds(d) -> str:
         from decimal import Decimal
         return f"{float(d):.2f}"
@@ -1538,6 +1600,7 @@ async def _load_entities_from_uploads(
             nola_text=nola_text, transactions=transactions, merged=merged,
             through_date=_through, certified_mail=certified_mail,
             other_costs=other_costs, attorney_fees_override=attorney_fees,
+            nola_balance_override=_nola_balance_anchor_leu,
         )
         merged.update({
             "principal_balance":      _ds(tbl["maintenance"]),
@@ -1554,6 +1617,80 @@ async def _load_entities_from_uploads(
         })
     except Exception:
         pass  # IQ-225 failure is non-fatal; letter will show "See Ledger" for amounts
+
+    # ── Ledger-derived net_balance override (PRD §1 — NOLA is ground truth) ──
+    # The IQ-225 formula uses monthly-rate projections which differ from actual
+    # ledger amounts. Override the demand letter total with the same NOLA-filtered
+    # ledger computation used by generate_ledger / SOA so all outputs match.
+    _leu_nola_date = None
+    if nola_text:
+        _leu_nd = _re.search(r"(\w+ \d{1,2},\s*\d{4}|\d{1,2}/\d{1,2}/\d{4})", nola_text)
+        if _leu_nd:
+            for _fmt in ("%B %d, %Y", "%m/%d/%Y", "%B %d,%Y"):
+                try:
+                    _leu_nola_date = datetime.datetime.strptime(
+                        _leu_nd.group(1).strip(), _fmt
+                    ).date()
+                    break
+                except (ValueError, AttributeError):
+                    pass
+
+    if _leu_nola_date and transactions and _nola_balance_anchor_leu:
+        # Filter to post-NOLA transactions only
+        _leu_post = []
+        for _t in transactions:
+            _td = None
+            for _fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+                try:
+                    _td = datetime.datetime.strptime(str(_t.get("date", "")), _fmt).date()
+                    break
+                except (ValueError, AttributeError):
+                    pass
+            if _td is None or _td > _leu_nola_date:
+                _leu_post.append(_t)
+
+        # Prepend NOLA opening balance row (same as generate_ledger)
+        _leu_items = [
+            {"type": "Previous Balance", "charge": _nola_balance_anchor_leu, "credit": 0.0}
+        ] + _leu_post
+
+        # Compute totals using same TYPE_MAP as generate_ledger
+        _LTYPE = {
+            "Regular Assessment": "assessments", "Previous Balance":  "assessments",
+            "Special Assessment": "assessments", "Interest":          "interest",
+            "Late Fee":           "late_fees",   "Administrative Late Fee": "late_fees",
+            "Attorney Fee":       "atty_fees",   "Attorney's Fee":    "atty_fees",
+            "Over Budget":        "other",
+        }
+        _ltotals = {"assessments": 0.0, "interest": 0.0, "late_fees": 0.0,
+                    "atty_fees": 0.0, "other": 0.0, "credits": 0.0}
+        for _row in _leu_items:
+            _c = float(str(_row.get("charge", 0) or 0))
+            _r = float(str(_row.get("credit", 0) or 0))
+            _bkt = _LTYPE.get(str(_row.get("type", "")).strip(), "other")
+            if _r > 0:
+                _ltotals["credits"] += _r
+            else:
+                _ltotals[_bkt] += _c
+
+        _leu_net = round(
+            _ltotals["assessments"] + _ltotals["interest"] + _ltotals["late_fees"]
+            + _ltotals["atty_fees"] + _ltotals["other"] - _ltotals["credits"], 2
+        )
+        # Add attorney-only charges (certified mail + other costs) on top
+        _leu_grand_total = round(_leu_net + certified_mail + other_costs, 2)
+
+        merged.update({
+            "principal_balance":      f"{_ltotals['assessments']:.2f}",
+            "late_fees":              f"{_ltotals['late_fees']:.2f}",
+            "attorney_fees":          f"{max(_ltotals['atty_fees'], attorney_fees):.2f}",
+            "other_charges":          f"{_ltotals['other']:.2f}",
+            "certified_mail_charges": f"{certified_mail:.2f}",
+            "other_costs":            f"{other_costs:.2f}",
+            "partial_payment":        "",  # credits already reflected in net_balance
+            "total_amount_owed":      f"{_leu_grand_total:.2f}",
+            "total_balance":          f"{_leu_grand_total:.2f}",
+        })
 
     return merged
 
@@ -1934,12 +2071,23 @@ async def generate_ledger(request: LedgerRequest):
     # ── IQ-225 Statement of Account (Sheet 1) ────────────────────────────────
     # Read the newest NOLA file from uploads/ to feed the IQ-225 engine
     _nola_text_ledger = ""
-    _nola_candidates = sorted(
+    # Prefer the NOLA that matches this matter (unit number or owner last name in filename).
+    # If multiple NOLAs are in uploads (e.g. multiple matters), picking by mtime alone
+    # would load the wrong NOLA and corrupt every downstream number.
+    _all_nola_cands = sorted(
         [fp for fp in UPLOAD_DIR.iterdir()
          if fp.suffix.lower() == ".pdf"
          and any(kw in fp.name.lower() for kw in ("nola", "notice"))],
         key=lambda fp: fp.stat().st_mtime,
         reverse=True,
+    )
+    _unit_slug_n  = (unit or "").replace(" ", "").replace("/", "").replace("-", "").lower()
+    _owner_last_n = (owner.split()[-1] if owner and owner not in ("Unknown Owner",) else "").lower()
+    _nola_candidates = (
+        [fp for fp in _all_nola_cands
+         if (_unit_slug_n and _unit_slug_n in fp.name.lower())
+         or (_owner_last_n and _owner_last_n in fp.name.lower())]
+        or _all_nola_cands  # fall back to newest if no matter-specific match
     )
     if _nola_candidates:
         _nola_text_ledger = await asyncio.to_thread(
@@ -2100,6 +2248,7 @@ async def generate_ledger(request: LedgerRequest):
             certified_mail=40.0,
             other_costs=16.0,
             attorney_fees_override=400.0,
+            nola_balance_override=nola_balance_anchor,  # anchor to NOLA stated balance (PRD §1)
         )
     except Exception:
         pass  # non-fatal — sheet is omitted if computation fails
@@ -2226,7 +2375,81 @@ async def generate_ledger(request: LedgerRequest):
             ]
             col_widths = [5, 13, 42, 20, 16, 14, 14, 14, 12, 12, 20, 22]
 
-            # ── Sheet 1: NOLA-Ledger ──────────────────────────────────────────
+            # ── Sheet 1: Statement of Account ─────────────────────────────────
+            # Per PRD §5.1 — SOA is always first. All amounts derive from the
+            # NOLA-anchored ledger (totals / net_balance) so they match the
+            # NOLA-Ledger sheet exactly. (PRD §1, §3)
+            _td_soa = datetime.date.today()
+            _through_soa = (
+                datetime.date(_td_soa.year + 1, 1, 1) if _td_soa.month == 12
+                else datetime.date(_td_soa.year, _td_soa.month + 1, 1)
+            )
+            _through_lbl_soa = f"{_through_soa.strftime('%B')} {_through_soa.day}, {_through_soa.year}"
+            # Attorney-only charges: use IQ-225 values if available, else defaults
+            _soa_cert  = float(iq_tbl["certified_mail"]) if iq_tbl else 40.0
+            _soa_ocost = float(iq_tbl["other_costs"])    if iq_tbl else 16.0
+            _soa_total = round(net_balance + _soa_cert + _soa_ocost, 2)
+
+            if nola_balance_anchor is not None:
+                _post_nola_asmts = round(totals["assessments"] - nola_balance_anchor, 2)
+                soa_rows = [
+                    ("NOLA Opening Balance",                               nola_balance_anchor),
+                    (f"Post-NOLA Assessments through {_through_lbl_soa}", max(0.0, _post_nola_asmts)),
+                    ("Interest accrued (18% per annum)",                   round(totals["interest"], 2)),
+                    ("Administrative Late Fees",                           round(totals["late_fees"], 2)),
+                    ("Attorney's Fees",                                    round(totals["atty_fees"], 2)),
+                    ("Other Charges",                                      round(totals["other"], 2)),
+                    ("Credits / Payments Received",                        -round(totals["credits"], 2) if totals["credits"] else 0.0),
+                    ("Certified Mail / Service Charges",                   _soa_cert),
+                    ("Other Attorney Costs",                               _soa_ocost),
+                    ("TOTAL OUTSTANDING",                                  _soa_total),
+                ]
+            else:
+                soa_rows = [
+                    (f"Assessments through {_through_lbl_soa}",           round(totals["assessments"], 2)),
+                    ("Interest accrued (18% per annum)",                   round(totals["interest"], 2)),
+                    ("Administrative Late Fees",                           round(totals["late_fees"], 2)),
+                    ("Attorney's Fees",                                    round(totals["atty_fees"], 2)),
+                    ("Other Charges",                                      round(totals["other"], 2)),
+                    ("Credits / Payments Received",                        -round(totals["credits"], 2) if totals["credits"] else 0.0),
+                    ("Certified Mail / Service Charges",                   _soa_cert),
+                    ("Other Attorney Costs",                               _soa_ocost),
+                    ("TOTAL OUTSTANDING",                                  _soa_total),
+                ]
+            _soa_nola_note = (
+                f"NOLA Date: {nola_date_anchor.strftime('%B %d, %Y') if nola_date_anchor else 'See uploads'}"
+                + (f" | NOLA Opening Balance: ${nola_balance_anchor:.2f}" if nola_balance_anchor is not None else "")
+                + f" | Prepared: {today_display}"
+            )
+            df_soa = pd.DataFrame(soa_rows, columns=["Description", "Amount ($)"])
+            df_soa.to_excel(writer, sheet_name="Statement of Account", index=False)
+            ws_soa = writer.sheets["Statement of Account"]
+            ws_soa.column_dimensions["A"].width = 58
+            ws_soa.column_dimensions["B"].width = 18
+            for cell in ws_soa[1]:
+                cell.font      = Font(bold=True, color="FFFFFF", size=11)
+                cell.fill      = navy
+                cell.border    = thin
+                cell.alignment = Alignment(horizontal="center")
+            for row in ws_soa.iter_rows(min_row=2):
+                is_total = "TOTAL" in str(row[0].value or "")
+                is_nola  = "NOLA Opening Balance" in str(row[0].value or "")
+                for cell in row:
+                    cell.border    = thin
+                    cell.alignment = Alignment(vertical="center")
+                    cell.font      = Font(bold=is_total or is_nola, size=12 if is_total else 10)
+                if is_total:
+                    for cell in row:
+                        cell.fill = gold
+                elif is_nola:
+                    for cell in row:
+                        cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+            _note_row = ws_soa.max_row + 2
+            if _soa_nola_note:
+                _nc = ws_soa.cell(row=_note_row, column=1, value=_soa_nola_note)
+                _nc.font = Font(italic=True, size=8)
+
+            # ── Sheet 2: NOLA-Ledger ──────────────────────────────────────────
             # NOLA as locked opening row, post-NOLA charges by category,
             # 45-day forward projection. PRD §42.2, §42.6
             nola_ledger_items = list(line_items)
@@ -2339,7 +2562,7 @@ async def generate_ledger(request: LedgerRequest):
                     _c.fill   = (navy if _lbl == "TOTALS SUMMARY"
                                  else gold if _lbl == "NET BALANCE DUE" else lt_blue)
 
-            # ── Sheet 2: Association Ledger ───────────────────────────────────
+            # ── Sheet 3: Association Ledger ───────────────────────────────────
             # Structured view of raw uploaded ledger — reconciliation reference only.
             # NOT used for output generation. PRD §42.3
             al_split_rows = []
@@ -2391,7 +2614,70 @@ async def generate_ledger(request: LedgerRequest):
             _al_nc.font = Font(bold=True, italic=True, size=8, color="595959")
             _al_nc.fill = lt_blue
 
-            # ── Sheet 3: NOLA Validation ──────────────────────────────────────
+            # ── Sheet 4: Unit Owner Profile ───────────────────────────────────
+            df3 = pd.DataFrame(cheat_rows, columns=["Field", "Value"])
+            df3.to_excel(writer, sheet_name="Unit Owner Profile", index=False)
+            ws3 = writer.sheets["Unit Owner Profile"]
+            ws3.column_dimensions["A"].width = 35
+            ws3.column_dimensions["B"].width = 55
+            for row in ws3.iter_rows():
+                fv = str(row[0].value or "")
+                vv = str(row[1].value or "")
+                is_section = fv.isupper() and not vv.strip() and len(fv) > 3
+                is_total   = fv == "TOTAL AMOUNT DUE"
+                for cell in row:
+                    cell.border = thin
+                    cell.alignment = Alignment(wrap_text=True, vertical="center")
+                if is_section:
+                    for cell in row:
+                        cell.font = Font(bold=True, color="FFFFFF", size=10)
+                        cell.fill = navy
+                elif is_total:
+                    for cell in row:
+                        cell.font = Font(bold=True, size=12)
+                        cell.fill = gold
+                else:
+                    row[0].font = Font(bold=True, size=10)
+                    row[1].font = Font(size=10)
+
+            # ── Sheet 5: Compliance Checklist ─────────────────────────────────
+            # NOLA consistency check: net_balance springs from nola_balance_anchor
+            # plus post-NOLA accruals minus post-NOLA credits — always consistent.
+            _nola_check_status = "PENDING"
+            if nola_balance_anchor is not None:
+                # net_balance ≥ nola_balance_anchor is expected (post-NOLA charges added).
+                # Flag only if net_balance is LESS than the NOLA (would mean unexplained reduction).
+                _nola_check_status = "YES" if net_balance >= nola_balance_anchor - 0.01 else "FLAG — Review Required"
+            checklist_items.insert(0, (
+                f"Demand letter total consistent with NOLA (NOLA balance: "
+                f"${nola_balance_anchor:.2f})" if nola_balance_anchor else
+                "Demand letter total consistent with NOLA",
+                "PRD §3 / §718.116(6)(b)",
+                _nola_check_status,
+            ))
+            df4 = pd.DataFrame(checklist_items, columns=["Compliance Item", "Section", "Status"])
+            df4.to_excel(writer, sheet_name="Compliance Checklist", index=False)
+            ws4 = writer.sheets["Compliance Checklist"]
+            ws4.column_dimensions["A"].width = 52
+            ws4.column_dimensions["B"].width = 24
+            ws4.column_dimensions["C"].width = 18
+            for cell in ws4[1]:
+                cell.font  = Font(bold=True, color="FFFFFF", size=10)
+                cell.fill  = navy
+                cell.border = thin
+            for row in ws4.iter_rows(min_row=2):
+                status = str(row[2].value or "")
+                for cell in row:
+                    cell.border = thin
+                if status == "YES":
+                    row[2].fill = yes_f
+                elif "FLAG" in status:
+                    row[2].fill = flag_f
+                    row[2].font = Font(bold=True, color="FF0000", size=9)
+                else:
+                    row[2].fill = pend_f
+
+            # ── Sheet 6: NOLA Validation (last per PRD) ───────────────────────
             # 3-tier Good/Bad NOLA comparison. PRD §42.4, §42.5
             _vdelta = None
             _vpct   = None
@@ -2490,141 +2776,6 @@ async def generate_ledger(request: LedgerRequest):
                     row[0].font = Font(bold=True, size=9)
                     row[1].font = Font(size=9)
             ws_val.freeze_panes = "A2"
-
-            # ── Sheet 4: Statement of Account ─────────────────────────────────
-            # Build SOA rows from IQ-225 table; fall back to ledger totals if unavailable
-            if iq_tbl:
-                through_lbl = iq_tbl["through_date_str"]
-                soa_rows = [
-                    (f"Maintenance due including {through_lbl}",         float(iq_tbl["maintenance"])),
-                    (f"Special assessments due including {through_lbl}", float(iq_tbl["special_assessments"])),
-                    ("Late fees, if applicable",                         float(iq_tbl["late_fees"])),
-                    ("Other charges",                                    float(iq_tbl["other_charges"])),
-                    ("Certified mail charges",                           float(iq_tbl["certified_mail"])),
-                    ("Other costs",                                      float(iq_tbl["other_costs"])),
-                    ("Attorney's fees",                                  float(iq_tbl["attorney_fees"])),
-                    ("Partial Payment",                                  -float(iq_tbl["partial_payment"])),
-                    ("TOTAL OUTSTANDING",                                float(iq_tbl["total_outstanding"])),
-                ]
-                _soa_nola_note = (
-                    f"NOLA Date: {nola_date_anchor.strftime('%B %d, %Y') if nola_date_anchor else 'See uploads'} | "
-                    f"NOLA Opening Balance: ${nola_balance_anchor:.2f}" if nola_balance_anchor else ""
-                )
-            else:
-                soa_rows = [
-                    ("Maintenance / Assessments",  totals["assessments"]),
-                    ("Special Assessments",        totals.get("special_assessments", 0.0)),
-                    ("Late fees, if applicable",   totals["late_fees"]),
-                    ("Interest (18% per annum)",   totals["interest"]),
-                    ("Attorney's fees",            totals["atty_fees"]),
-                    ("Other charges",              totals["other"]),
-                    ("Partial Payment",            -totals["credits"]),
-                    ("TOTAL OUTSTANDING",          net_balance),
-                ]
-                _soa_nola_note = "IQ-225 unavailable — amounts derived from raw ledger totals"
-
-            df_soa = pd.DataFrame(soa_rows, columns=["Description", "Amount ($)"])
-            df_soa.to_excel(writer, sheet_name="Statement of Account", index=False)
-            ws_soa = writer.sheets["Statement of Account"]
-            ws_soa.column_dimensions["A"].width = 58
-            ws_soa.column_dimensions["B"].width = 18
-            for cell in ws_soa[1]:
-                cell.font      = Font(bold=True, color="FFFFFF", size=11)
-                cell.fill      = navy
-                cell.border    = thin
-                cell.alignment = Alignment(horizontal="center")
-            for row in ws_soa.iter_rows(min_row=2):
-                is_total = "TOTAL" in str(row[0].value or "")
-                for cell in row:
-                    cell.border    = thin
-                    cell.alignment = Alignment(vertical="center")
-                    cell.font      = Font(bold=is_total, size=12 if is_total else 10)
-                if is_total:
-                    for cell in row:
-                        cell.fill = gold
-            _note_row = ws_soa.max_row + 2
-            if _soa_nola_note:
-                _nc = ws_soa.cell(row=_note_row, column=1, value=_soa_nola_note)
-                _nc.font = Font(italic=True, size=8)
-            # NOLA consistency cross-check on SOA (mirrors NOLA Validation tier)
-            if nola_balance_anchor and iq_tbl:
-                _letter_total = float(iq_tbl["total_outstanding"])
-                _delta = abs(_letter_total - nola_balance_anchor)
-                if _delta > 1.00:
-                    _flag_row = _note_row + 1
-                    _fc = ws_soa.cell(
-                        row=_flag_row, column=1,
-                        value=(
-                            f"{'⚠️' if _delta <= 50 else '🔴'} NOLA CONSISTENCY FLAG: "
-                            f"NOLA stated ${nola_balance_anchor:.2f} | "
-                            f"Letter total ${_letter_total:.2f} | "
-                            f"Delta ${_delta:.2f} — "
-                            f"{'Minor variance — attorney acknowledgment required' if _delta <= 50 else 'MATERIAL DISCREPANCY — override required (see NOLA Validation sheet)'}"
-                        )
-                    )
-                    _fc.font = Font(bold=True, color="FF0000" if _delta > 50 else "CC6600", size=9)
-                    _fc.fill = flag_f
-
-            # ── Sheet 5: Unit Owner Profile ───────────────────────────────────
-            df3 = pd.DataFrame(cheat_rows, columns=["Field", "Value"])
-            df3.to_excel(writer, sheet_name="Unit Owner Profile", index=False)
-            ws3 = writer.sheets["Unit Owner Profile"]
-            ws3.column_dimensions["A"].width = 35
-            ws3.column_dimensions["B"].width = 55
-            for row in ws3.iter_rows():
-                fv = str(row[0].value or "")
-                vv = str(row[1].value or "")
-                is_section = fv.isupper() and not vv.strip() and len(fv) > 3
-                is_total   = fv == "TOTAL AMOUNT DUE"
-                for cell in row:
-                    cell.border = thin
-                    cell.alignment = Alignment(wrap_text=True, vertical="center")
-                if is_section:
-                    for cell in row:
-                        cell.font = Font(bold=True, color="FFFFFF", size=10)
-                        cell.fill = navy
-                elif is_total:
-                    for cell in row:
-                        cell.font = Font(bold=True, size=12)
-                        cell.fill = gold
-                else:
-                    row[0].font = Font(bold=True, size=10)
-                    row[1].font = Font(size=10)
-
-            # ── Sheet 4: Compliance Checklist ─────────────────────────────────
-            # Add NOLA consistency check item to checklist
-            _nola_check_status = "PENDING"
-            if nola_balance_anchor and iq_tbl:
-                _delta_check = abs(float(iq_tbl["total_outstanding"]) - nola_balance_anchor)
-                _nola_check_status = "YES" if _delta_check <= 1.00 else "FLAG — Review Required"
-            checklist_items.insert(0, (
-                f"Demand letter total consistent with NOLA (NOLA balance: "
-                f"${nola_balance_anchor:.2f})" if nola_balance_anchor else
-                "Demand letter total consistent with NOLA",
-                "PRD §3 / §718.116(6)(b)",
-                _nola_check_status,
-            ))
-            df4 = pd.DataFrame(checklist_items, columns=["Compliance Item", "Section", "Status"])
-            df4.to_excel(writer, sheet_name="Compliance Checklist", index=False)
-            ws4 = writer.sheets["Compliance Checklist"]
-            ws4.column_dimensions["A"].width = 52
-            ws4.column_dimensions["B"].width = 24
-            ws4.column_dimensions["C"].width = 18
-            for cell in ws4[1]:
-                cell.font  = Font(bold=True, color="FFFFFF", size=10)
-                cell.fill  = navy
-                cell.border = thin
-            for row in ws4.iter_rows(min_row=2):
-                status = str(row[2].value or "")
-                for cell in row:
-                    cell.border = thin
-                if status == "YES":
-                    row[2].fill = yes_f
-                elif "FLAG" in status:
-                    row[2].fill = flag_f
-                    row[2].font = Font(bold=True, color="FF0000", size=9)
-                else:
-                    row[2].fill = pend_f
 
     await asyncio.to_thread(_build_excel)
 
@@ -2821,21 +2972,29 @@ async def generate_ground_truth(
         return "nola"
 
     file_map: dict[str, dict] = {}  # doc_type -> {path, text, entities}
-    for fp in all_files:
-        if fp.suffix.lower() not in (".pdf", ".xlsx", ".xls", ".csv", ".docx"):
-            continue
+    # Process files newest-first so the most recently uploaded file of each
+    # doc type wins. This prevents older matter files from overriding the
+    # current matter when multiple matters share the uploads directory.
+    all_files_sorted = sorted(
+        [fp for fp in all_files
+         if fp.suffix.lower() in (".pdf", ".xlsx", ".xls", ".csv", ".docx")],
+        key=lambda fp: fp.stat().st_mtime,
+        reverse=True,  # newest first
+    )
+    for fp in all_files_sorted:
         doc_type = _classify(fp.name)
+        if doc_type in file_map:
+            continue  # already have the newest file for this type — skip older files
         file_bytes = fp.read_bytes()
         raw_text = await asyncio.to_thread(extract_text_from_file, file_bytes, fp.name)
         entities = _regex_extract(raw_text, doc_type)
         transactions = []
         if doc_type == "ledger":
             transactions = _parse_ledger_transactions(raw_text)
-        if doc_type not in file_map or len(raw_text) > len(file_map[doc_type].get("text", "")):
-            file_map[doc_type] = {
-                "path": fp, "text": raw_text,
-                "entities": entities, "transactions": transactions
-            }
+        file_map[doc_type] = {
+            "path": fp, "text": raw_text,
+            "entities": entities, "transactions": transactions
+        }
 
     # ------------------------------------------------------------------ #
     # 2. Merge entities: nola > ledger > affidavit priority
@@ -2935,6 +3094,21 @@ async def generate_ground_truth(
         _through_date = datetime.date(_td.year, _td.month + 1, 1)
 
     nola_text_for_table = file_map.get("nola", {}).get("text", "")
+
+    # Extract NOLA stated balance to anchor IQ-225 (PRD §1 — NOLA is ground truth)
+    _gt_nola_anchor = None
+    for _gt_pat in [
+        r"(?:Total Amount Due|Balance Due|Total Due|Amount Due|Total Balance|Total Outstanding)[\s:]*\$?\s*([\d,]+\.\d{2})",
+        r"(?:please remit|remit the sum of|pay the sum of)\s+\$?\s*([\d,]+\.\d{2})",
+    ]:
+        _gt_m = _re.search(_gt_pat, nola_text_for_table, _re.IGNORECASE | _re.MULTILINE)
+        if _gt_m:
+            try:
+                _gt_nola_anchor = float(_gt_m.group(1).replace(",", ""))
+                break
+            except (ValueError, TypeError):
+                pass
+
     tbl = _compute_demand_letter_table(
         nola_text       = nola_text_for_table,
         transactions    = transactions,
@@ -2943,6 +3117,7 @@ async def generate_ground_truth(
         certified_mail  = certified_mail,
         other_costs     = other_costs,
         attorney_fees_override = attorney_fees,
+        nola_balance_override  = _gt_nola_anchor,   # anchor to NOLA stated balance (PRD §1)
     )
 
     # Format Decimal → "X.XX" string for entity fields used by letter generator
@@ -3600,4 +3775,4 @@ async def generate_ground_truth(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=True)

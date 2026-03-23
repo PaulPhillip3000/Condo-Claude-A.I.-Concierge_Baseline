@@ -3,32 +3,22 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.Python
-*.egg-info/
-dist/
-build/
-
-# Virtual environment
+.env
 venv/
 env/
-.venv/
 
-# Environment variables / secrets
-.env
-*.env
+# Node
+node_modules/
 
 # Database
 *.db
-*.sqlite3
+*.sqlite
 
-# Generated outputs
+# Output files (generated)
 outputs/
-uploads/
-inputs/
 
-# Logs
-*.log
-logs/
+# Uploads
+uploads/
 
 # OS
 .DS_Store
@@ -37,12 +27,3 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
-.claude/
-
-# Node / frontend build artifacts
-frontend/node_modules/
-frontend/dist/
-frontend/.env
-
-# Samples (large binaries)
-samples/
