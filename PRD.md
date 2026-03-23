@@ -7808,7 +7808,7 @@ All documents generated or uploaded must follow a consistent, human-readable, an
 **Format:**
 
 ```
-[AssociationName]_[UnitOwnerLastName]_[UnitIdentifier]_[DocumentType]_[Version]_[YYYY-MM-DD].[ext]
+[AssociationName]_[UnitOwnerLastName]_[UnitIdentifier]_[DocumentType]_[YYYY-MM-DD].[ext]
 ```
 
 **Rules:**
@@ -7817,16 +7817,16 @@ All documents generated or uploaded must follow a consistent, human-readable, an
 - Association name truncated to 30 characters if longer — truncation uses the first 30 characters of the normalized name
 - Unit identifier uses unit number if available; falls back to abbreviated property address if not
 - Date is the generation date (YYYY-MM-DD), not the matter creation date
-- Version number always present — v1 for first generation, v2 for first revision, and so on
+- **No version number in filename** — version is inferred from the date. Multiple generations on the same date are distinguished by timestamp if needed.
+- Document type uses concise labels: `FirstDemand` (not `FirstDemandLetter`), `Ledger`, `ClaimOfLien`, `Payoff`
 
 **Examples:**
 
 ```
-PalmBeachCondo_Doe_Unit12A_FirstDemandLetter_v1_2026-03-20.pdf
-PalmBeachCondo_Doe_Unit12A_FirstDemandLetter_v2_2026-04-01.pdf
-PalmBeachCondo_Doe_Unit12A_Ledger_v3_2026-04-01.xlsx
-PalmBeachCondo_Doe_Unit12A_ClaimOfLien_v1_2026-04-15.pdf
-PalmBeachCondo_Doe_Unit12A_Payoff_v1_2026-04-20.pdf
+PalmBeachCondo_Doe_Unit12A_FirstDemand_2026-03-20.docx
+PalmBeachCondo_Doe_Unit12A_Ledger_2026-04-01.xlsx
+PalmBeachCondo_Doe_Unit12A_ClaimOfLien_2026-04-15.pdf
+PalmBeachCondo_Doe_Unit12A_Payoff_2026-04-20.pdf
 PalmBeachCondo_Doe_Unit12A_NOLAOriginal_Uploaded_2026-03-01.pdf
 ```
 
@@ -7837,8 +7837,7 @@ PalmBeachCondo_Doe_Unit12A_NOLAOriginal_Uploaded_2026-03-01.pdf
 | Association Name | Association record (normalized) | First 30 chars, underscored |
 | Unit Owner Last Name | Core Matter Variables — Owner Name | Last name only for brevity |
 | Unit Identifier | Unit number from Core Matter Variables | Falls back to abbreviated address |
-| Document Type | Standardized type label (§38.3) | Fixed vocabulary |
-| Version | Document version number | Always present; never omitted |
+| Document Type | Standardized type label (§38.3) | Concise: FirstDemand, Ledger, etc. |
 | Date | Generation date (YYYY-MM-DD) | ISO format |
 
 **Optional future fields (Phase 2):**

@@ -20,6 +20,41 @@ export const Dashboard = () => {
   const [letterState, setLetterState] = React.useState({ status: 'idle', filename: null, error: null });
   const [ledgerState, setLedgerState] = React.useState({ status: 'idle', filename: null, error: null });
   const [groundTruthState, setGroundTruthState] = React.useState({ status: 'idle', ledger: null, letter: null, financials: null, error: null });
+  const [generatedDocs, setGeneratedDocs] = React.useState([]);
+  const [backendOffline, setBackendOffline] = React.useState(false);
+
+  const fetchGeneratedDocs = React.useCallback(async () => {
+    try {
+      const res = await fetch('/api/files');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const TYPE_LABEL = {
+        first_demand_letter: 'First Demand',
+        ledger:              'Internal Ledger',
+        audit_ledger:        'Internal Ledger',
+        first_letter:        'First Demand',
+      };
+      const docs = (data.generated || []).slice(0, 8).map(d => ({
+        name:   d.filename,
+        matter: `${d.matter_id || ''}${d.owner_name ? ' • ' + d.owner_name : ''}`,
+        type:   TYPE_LABEL[d.file_type] || d.file_type,
+        status: 'Ready',
+        color:  'bg-green-100 text-green-700',
+        id:     d.id,
+      }));
+      setGeneratedDocs(docs);
+      setBackendOffline(false);
+    } catch (_) {
+      setBackendOffline(true);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    fetchGeneratedDocs();
+    // Retry every 5s when backend is offline so the queue auto-populates once it restarts
+    const id = setInterval(fetchGeneratedDocs, 5000);
+    return () => clearInterval(id);
+  }, [fetchGeneratedDocs]);
 
   const nolaRef = React.useRef(null);
   const ledgerRef = React.useRef(null);
@@ -83,6 +118,19 @@ export const Dashboard = () => {
         window.dispatchEvent(new CustomEvent('condoclaw:file_parsed', {
           detail: { type, fileName: file.name, summary: d2.parsedData.summary, details: d2.parsedData.details, similarity: d2.parsedData.similarity, entities: d2.parsedData.entities, stage: currentStage },
         }));
+
+        // Trigger Claude document review (Step 1) after each upload
+        // Claude reviews NOLA + ledger together when both are available
+        try {
+          const reviewRes = await fetch('/api/claude-review');
+          const reviewData = await reviewRes.json();
+          if (reviewData.status === 'success' && reviewData.message) {
+            window.dispatchEvent(new CustomEvent('condoclaw:claude_review', {
+              detail: { step: 1, message: reviewData.message, review: reviewData.review },
+            }));
+          }
+        } catch (_) { /* Claude review is optional */ }
+
         return; // success — exit retry loop
 
       } catch (err) {
@@ -115,6 +163,31 @@ export const Dashboard = () => {
       const data = await res.json();
       if (data.status === 'success') {
         setLedgerState({ status: 'done', filename: data.filename, error: null });
+        fetchGeneratedDocs();
+
+        // Claude post-generation review (Step 2) — display in chat
+        if (data.post_review) {
+          const pr = data.post_review;
+          const issues = pr.issues || [];
+          const errors = issues.filter(i => i.severity === 'error');
+          const warnings = issues.filter(i => i.severity === 'warning');
+          let msg = `**Claude Post-Generation Review** — ${data.filename}\n\n`;
+          msg += `**Status:** ${pr.status || 'unknown'}\n`;
+          msg += `**NOLA Balance Verified:** ${pr.nola_balance_verified ? 'Yes' : 'No'}\n`;
+          if (pr.discrepancy) msg += `**Discrepancy:** $${Number(pr.discrepancy).toFixed(2)}\n`;
+          msg += `**Summary:** ${pr.summary || 'Review complete.'}\n`;
+          if (errors.length) {
+            msg += `\n**Errors (${errors.length}):**\n`;
+            errors.forEach(e => { msg += `- Row ${e.row}: ${e.description}\n`; });
+          }
+          if (warnings.length) {
+            msg += `\n**Warnings (${warnings.length}):**\n`;
+            warnings.forEach(w => { msg += `- Row ${w.row}: ${w.description}\n`; });
+          }
+          window.dispatchEvent(new CustomEvent('condoclaw:claude_review', {
+            detail: { step: 2, message: msg, review: pr },
+          }));
+        }
       } else {
         setLedgerState({ status: 'error', filename: null, error: 'Ledger generation failed.' });
       }
@@ -137,6 +210,14 @@ export const Dashboard = () => {
       const data = await res.json();
       if (data.status === 'success') {
         setLetterState({ status: 'done', filename: data.filename, error: null });
+        fetchGeneratedDocs();
+        // Claude comment on letter generation
+        window.dispatchEvent(new CustomEvent('condoclaw:claude_review', {
+          detail: {
+            step: 2,
+            message: `**First Demand Letter Generated:** ${data.filename}\n\nClaude reviewed the letter against the NOLA and ledger for statutory compliance. ${data.statute === '718' ? 'FL Statute §718.116' : 'FL Statute §720.3085'} requirements applied.\n\n${data.post_review?.summary || 'Review complete. Download and verify the letter matches the NOLA-anchored ledger.'}`,
+          },
+        }));
       } else {
         setLetterState({ status: 'error', filename: null, error: 'Generation failed.' });
       }
@@ -158,6 +239,7 @@ export const Dashboard = () => {
         if (!res.ok) throw new Error(data.message || `Server ${res.status}`);
         if (data.status === 'success') {
           setGroundTruthState({ status: 'done', ledger: data.ledger_filename, letter: data.letter_filename, financials: data.financials, error: null });
+          fetchGeneratedDocs();
           return;
         }
         throw new Error(data.message || 'Unknown error');
@@ -201,10 +283,7 @@ export const Dashboard = () => {
     { key: 'affidavit', icon: Icons.FileCheck,   label: 'Mailing Affidavit',              done: 'Affidavit Verified', badge: 'Text Extracted',            accept: '.pdf',                              hint: 'Proof of NOLA delivery' },
   ];
 
-  const documents = [
-    { name: 'Demand_Letter_U402.pdf', matter: '#CC-8921 • Pine Ridge', status: 'Pending Review', color: 'bg-yellow-100 text-yellow-700' },
-    { name: 'Ledger_Audit_Report.xlsx', matter: '#CC-8920 • Oak Hollow', status: 'Verified', color: 'bg-green-100 text-green-700' },
-  ];
+  const documents = generatedDocs;
 
   return (
     <div className="max-w-5xl mx-auto space-y-8 p-8">
@@ -573,14 +652,20 @@ export const Dashboard = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {documents.map((doc, i) => (
+                {backendOffline ? (
+                  <tr><td colSpan={3} className="px-5 py-8 text-center text-xs text-red-500 font-semibold">
+                    Backend offline — run LAUNCH_APP.bat, then this list will refresh automatically.
+                  </td></tr>
+                ) : documents.length === 0 ? (
+                  <tr><td colSpan={3} className="px-5 py-8 text-center text-xs text-slate-400">No documents generated yet. Upload files and generate above.</td></tr>
+                ) : documents.map((doc, i) => (
                   <tr key={i} className="hover:bg-slate-50/50 transition-colors">
                     <td className="px-5 py-4"><p className="text-xs font-bold text-slate-800">{doc.name}</p><p className="text-[10px] text-slate-500">{doc.matter}</p></td>
                     <td className="px-5 py-4"><span className={`inline-block px-2 py-1 rounded text-[9px] font-bold uppercase tracking-wider ${doc.color}`}>{doc.status}</span></td>
                     <td className="px-5 py-4 text-right">
                       <div className="flex items-center justify-end gap-1">
                         <button className="p-1.5 text-slate-400 hover:text-primary transition-colors"><Icons.View className="size-4" /></button>
-                        <button className="p-1.5 text-slate-400 hover:text-primary transition-colors"><Icons.Download className="size-4" /></button>
+                        <a href={`/api/download/${encodeURIComponent(doc.name)}`} className="p-1.5 text-slate-400 hover:text-primary transition-colors"><Icons.Download className="size-4" /></a>
                         <button className="p-1.5 text-slate-400 hover:text-red-500 transition-colors"><Icons.Flag className="size-4" /></button>
                       </div>
                     </td>

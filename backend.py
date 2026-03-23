@@ -19,6 +19,11 @@ from typing import Optional, List
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
 import pandas as pd
 from docx import Document
 from docx.shared import Pt, Inches
@@ -203,8 +208,8 @@ async def process_pipeline():
     df = pd.DataFrame({
         "Date": ["2025-01-01", "2025-02-01", "2025-03-01"],
         "Description": ["Monthly Assessment", "Monthly Assessment", "Late Fee"],
-        "Amount": [458.00, 458.00, 25.00],
-        "Balance": [458.00, 916.00, 941.00]
+        "Amount": [500.00, 500.00, 25.00],
+        "Balance": [500.00, 1000.00, 1025.00]
     })
     df.to_excel(ledger_path, index=False, engine='openpyxl')
 
@@ -538,6 +543,246 @@ def _parse_nola_line_items(text: str) -> dict:
     return cats
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLAUDE DOCUMENT REVIEW LAYER — CENTERPIECE
+# ═══════════════════════════════════════════════════════════════════════════════
+# Before generating the Excel spreadsheet, Claude reviews the NOLA and uploaded
+# ledger together.  It understands FL statutes (§718.116, §720), accounting
+# principles, the statutory payment hierarchy, and CAM (Community Association
+# Manager) document conventions.  The review validates data, resolves dateless
+# items, flags inconsistencies, and produces a structured, verified dataset
+# that the Excel generator can trust.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CLAUDE_REVIEW_SYSTEM_PROMPT = """\
+You are a Florida condominium and HOA collections specialist with deep expertise in:
+
+1. **Florida Statute §718.116** (condominiums) and **§720.3085** (HOAs):
+   - Payment hierarchy: Interest → Late Fees → Costs of Collection → Assessments (oldest first)
+   - NOLA (Notice of Late Assessment) requirements and timelines
+   - Lien eligibility thresholds and cure periods
+
+2. **Community Association Management (CAM) accounting**:
+   - How property management companies (e.g., TOPS, BuildingLink, AppFolio) format ledgers
+   - "Previous Balance" / "Balance Forward" entries — these are opening balances carried from prior periods, NOT new charges
+   - How assessments, special assessments, water bills, delinquent fees, and collection costs are categorized
+   - Payment types: eCheck, ACH, check, cash — and how they appear on ledgers
+
+3. **NOLA–Ledger reconciliation**:
+   - The NOLA states a balance as of a date — this is the authoritative anchor
+   - The ledger should contain transactions that explain how the balance was reached
+   - Pre-NOLA ledger history should build up to (or close to) the NOLA balance
+   - Post-NOLA transactions continue from the NOLA balance forward
+
+Your task: Review the NOLA document and uploaded ledger together. Produce a structured JSON analysis that the Excel generator will use directly.
+
+CRITICAL RULES:
+- "Previous Balance" or "Balance Forward" items with NO DATE are opening balances from prior periods. Assign them the earliest date on the ledger or the start of the period they reference (e.g., "Assessment - Homeowner 2025" → 01/01/2025).
+- Every line item MUST have a date. If you cannot determine the date, use the NOLA date as a fallback and flag it.
+- Categorize every item: "Regular Assessment", "Special Assessment", "Interest", "Late Fee", "Attorney Fee", "Collection Cost", "Payment Received", "Credit/Waiver", "Water/Utility", "Other".
+- For each item, determine if it is pre-NOLA (date <= NOLA date) or post-NOLA (date > NOLA date).
+- Identify the delinquency start point: when did the account first go from zero/credit balance to positive (owing)?
+- Validate: does the sum of all pre-NOLA charges minus pre-NOLA credits/payments approximately equal the NOLA stated balance? If not, flag the discrepancy.
+- Break down the NOLA balance into categories (assessments, interest, late fees, attorney fees, other) based on the NOLA document.
+
+Respond with ONLY valid JSON (no markdown, no commentary) in this exact structure:
+{
+  "nola_date": "MM/DD/YYYY",
+  "nola_balance": 0.00,
+  "nola_breakdown": {
+    "assessments": 0.00,
+    "interest": 0.00,
+    "late_fees": 0.00,
+    "atty_fees": 0.00,
+    "other": 0.00
+  },
+  "delinquency_start_date": "MM/DD/YYYY",
+  "line_items": [
+    {
+      "date": "MM/DD/YYYY",
+      "description": "...",
+      "type": "Regular Assessment|Special Assessment|Interest|Late Fee|Attorney Fee|Collection Cost|Payment Received|Credit/Waiver|Water/Utility|Other",
+      "charge": 0.00,
+      "credit": 0.00,
+      "is_pre_nola": true,
+      "is_relevant": true,
+      "notes": "...",
+      "original_description": "..."
+    }
+  ],
+  "validation": {
+    "pre_nola_net": 0.00,
+    "nola_balance_match": true,
+    "discrepancy_amount": 0.00,
+    "flags": ["..."],
+    "warnings": ["..."]
+  }
+}
+"""
+
+
+async def _claude_review_documents(
+    nola_text: str,
+    ledger_text: str,
+    owner: str = "",
+    unit: str = "",
+    assoc: str = "",
+) -> dict:
+    """
+    Claude-powered document review layer.
+
+    Sends the NOLA and ledger text to Claude for analysis.  Claude understands
+    FL statutes, CAM accounting, and validates the data before Excel generation.
+
+    Returns a structured dict with validated line items, NOLA breakdown,
+    consistency checks, and flags.  Falls back to regex parsing if Claude
+    is unavailable.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key or not HAS_ANTHROPIC:
+        return None  # caller falls back to regex parsing
+
+    user_prompt = f"""Review these documents for a Florida condominium collections matter.
+
+**Owner:** {owner}
+**Unit:** {unit}
+**Association:** {assoc}
+
+--- NOLA DOCUMENT ---
+{nola_text[:6000]}
+
+--- UPLOADED LEDGER ---
+{ledger_text[:12000]}
+
+Analyze both documents together and return the structured JSON as specified."""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = await asyncio.to_thread(
+            client.messages.create,
+            model="claude-sonnet-4-20250514",
+            max_tokens=8000,
+            system=_CLAUDE_REVIEW_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        text = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return json.loads(text)
+    except Exception as e:
+        # Log but don't block — fall back to regex parsing
+        print(f"[CondoClaw] Claude review failed: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLAUDE POST-GENERATION REVIEW (Step 2)
+# ═══════════════════════════════════════════════════════════════════════════════
+# After the Excel data is assembled, Claude reviews the output like an attorney
+# performing a paired legal review.  It checks the generated data against the
+# original NOLA and ledger, flags issues, and suggests corrections.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CLAUDE_POST_REVIEW_SYSTEM = """\
+You are a senior Florida collections attorney reviewing an auto-generated NOLA ledger spreadsheet.
+
+Your job is to review the generated data and flag anything that an opposing attorney would object to:
+
+1. **Mathematical consistency**: Do the pre-NOLA charges add up to the NOLA balance? If not, what's the discrepancy?
+2. **Completeness**: Are there missing transactions between the NOLA and the latest ledger entry?
+3. **Dateless entries**: Are there any rows with no date? These need dates assigned.
+4. **Category accuracy**: Are charges in the right columns (assessments vs late fees vs other)?
+5. **Payment application**: Are payments applied per §718.116(3) hierarchy?
+6. **Unexplained numbers**: Any amounts that don't tie back to the NOLA or ledger?
+7. **Running balance**: Does the running balance chain correctly?
+
+Respond with ONLY valid JSON:
+{
+  "status": "pass|review_needed|block",
+  "issues": [
+    {
+      "severity": "error|warning|info",
+      "row": 0,
+      "description": "...",
+      "suggested_fix": "..."
+    }
+  ],
+  "nola_balance_verified": true,
+  "pre_nola_sum": 0.00,
+  "nola_stated_balance": 0.00,
+  "discrepancy": 0.00,
+  "summary": "One sentence summary of the review."
+}
+"""
+
+
+async def _claude_post_review(
+    nola_text: str,
+    ledger_text: str,
+    generated_rows: list,
+    nola_balance: float,
+    owner: str = "",
+    unit: str = "",
+) -> dict:
+    """
+    Step 2 of Claude review: Validates the generated Excel data against the
+    original NOLA and ledger.  Like an attorney paired legal review.
+
+    Returns a dict with issues, flags, and a pass/fail status.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key or not HAS_ANTHROPIC:
+        return None
+
+    # Format the generated rows as a readable table for Claude
+    _table_lines = []
+    for i, row in enumerate(generated_rows):
+        _table_lines.append(f"Row {i+1}: {' | '.join(str(c) for c in row)}")
+    _table_str = "\n".join(_table_lines[:80])  # limit to 80 rows
+
+    user_prompt = f"""Review this auto-generated NOLA ledger for {owner}, Unit {unit}.
+
+**NOLA stated balance:** ${nola_balance:,.2f}
+
+--- ORIGINAL NOLA ---
+{nola_text[:4000]}
+
+--- ORIGINAL LEDGER ---
+{ledger_text[:8000]}
+
+--- GENERATED NOLA-LEDGER (Sheet 2) ---
+Columns: #, Date, Description, Type, Assessments, Interest, Late Fees, Atty Fees, Other, Payments, Credits, Running Balance, Notes
+{_table_str}
+
+Review this output. Flag any issues an opposing attorney would catch."""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = await asyncio.to_thread(
+            client.messages.create,
+            model="claude-sonnet-4-20250514",
+            max_tokens=4000,
+            system=_CLAUDE_POST_REVIEW_SYSTEM,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return json.loads(text)
+    except Exception as e:
+        print(f"[CondoClaw] Claude post-review failed: {e}")
+        return None
+
+
 def _compute_demand_letter_table(
     nola_text: str,
     transactions: list,
@@ -726,8 +971,12 @@ def _parse_ledger_transactions(text: str) -> list:
         if m:
             amt = float(m.group(1).replace(",", ""))
             running_balance = round(running_balance + amt, 2)
+            # Assign a date from the group name year (e.g., "ASSESSMENT 2025" → 01/01/2025)
+            _yr_match = _re.search(r"(\d{4})", current_group)
+            _prev_date = f"01/01/{_yr_match.group(1)}" if _yr_match else ""
             items.append({
-                "date": "", "description": f"Previous Balance — {current_group}",
+                "date": _prev_date,
+                "description": f"Previous Balance — {current_group}",
                 "type": "Previous Balance", "batch": "",
                 "charge": amt, "credit": 0.0, "balance": running_balance,
                 "group": current_group,
@@ -770,9 +1019,29 @@ def _parse_ledger_transactions(text: str) -> list:
             else:
                 ttype = "Other"
 
+            # Clean description: strip the group name if it already appears in desc
+            _grp_clean = current_group.strip()
+            _desc_clean = desc.strip()
+            # Normalize: collapse whitespace + remove digits so "Water Bill 2024"
+            # matches group "Water Bill 2025" even with NBSP or tabs from PDF extraction
+            def _norm(s):
+                s = _re.sub(r'\s+', ' ', s.replace('\xa0', ' ').replace('\t', ' '))
+                return _re.sub(r'\d+', '', s).lower().strip()
+            _grp_norm = _norm(_grp_clean)
+            _desc_norm = _norm(_desc_clean)
+            if _grp_clean and (
+                _desc_clean.lower().startswith(_grp_clean.lower()) or
+                (len(_grp_norm) > 5 and _desc_norm.startswith(_grp_norm))
+            ):
+                description = _desc_clean  # group is redundant — desc already conveys it
+            elif _grp_clean and _desc_clean:
+                description = f"{_desc_clean} ({_grp_clean})"
+            else:
+                description = _desc_clean or _grp_clean or desc
+
             items.append({
                 "date": date,
-                "description": f"{desc} — {current_group}" if current_group else desc,
+                "description": description,
                 "type": ttype, "batch": batch,
                 "charge": charge, "credit": credit, "balance": running_balance,
                 "group": current_group,
@@ -783,7 +1052,19 @@ def _parse_ledger_transactions(text: str) -> list:
         if _re.match(r"^(Total|Grand Total|GRAND TOTAL)", line, _re.IGNORECASE):
             continue
 
-    return items
+    # Sort by date so running balance flows chronologically
+    dated = [i for i in items if i.get("date")]
+    undated = [i for i in items if not i.get("date")]
+    dated.sort(key=lambda i: (
+        datetime.datetime.strptime(i["date"], "%m/%d/%Y")
+        if _re.match(r"\d{2}/\d{2}/\d{4}", i["date"]) else datetime.datetime.min
+    ))
+    # Recalculate running balance after sort
+    running_balance = 0.0
+    for i in dated + undated:
+        running_balance = round(running_balance + i["charge"] - i["credit"], 2)
+        i["balance"] = running_balance
+    return dated + undated
 
 
 def _calculate_delinquency(transactions: list, as_of_date: Optional[datetime.date] = None) -> dict:
@@ -1500,6 +1781,87 @@ async def parse_document(file: UploadFile = File(...), type: str = Form(...)):
         }}
 
 
+@app.get("/api/claude-review")
+async def get_claude_document_review():
+    """
+    Claude Document Review (Step 1) — triggered after documents are uploaded.
+    Reads the latest NOLA and ledger from uploads/ and returns Claude's analysis
+    for display in the AI Concierge chat.
+    """
+    # Find NOLA and ledger files
+    _nola_text = ""
+    _ledger_text = ""
+    _nola_file = ""
+    _ledger_file = ""
+
+    for fp in sorted(UPLOAD_DIR.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True):
+        if fp.suffix.lower() not in (".pdf", ".xlsx", ".xls", ".csv", ".docx"):
+            continue
+        n = fp.name.lower()
+        if not _nola_text and any(kw in n for kw in ("nola", "notice")):
+            _nola_text = extract_text_from_file(fp.read_bytes(), fp.name)
+            _nola_file = fp.name
+        elif not _ledger_text and any(kw in n for kw in ("ledger", "account", "statement", "transaction")):
+            _ledger_text = extract_text_from_file(fp.read_bytes(), fp.name)
+            _ledger_file = fp.name
+
+    if not _nola_text or not _ledger_text:
+        missing = []
+        if not _nola_text: missing.append("NOLA")
+        if not _ledger_text: missing.append("Ledger")
+        return {
+            "status": "incomplete",
+            "message": f"Upload both a NOLA and a Ledger to enable Claude review. Missing: {', '.join(missing)}.",
+        }
+
+    # Run Claude Step 1 review
+    review = await _claude_review_documents(
+        nola_text=_nola_text,
+        ledger_text=_ledger_text,
+    )
+
+    if not review:
+        return {
+            "status": "unavailable",
+            "message": "Claude review unavailable. Set ANTHROPIC_API_KEY in .env to enable document intelligence.",
+        }
+
+    # Format the review for the chat
+    validation = review.get("validation", {})
+    flags = validation.get("flags", [])
+    warnings = validation.get("warnings", [])
+    nola_bal = review.get("nola_balance", 0)
+    pre_nola_net = validation.get("pre_nola_net", 0)
+    match = validation.get("nola_balance_match", False)
+    discrepancy = validation.get("discrepancy_amount", 0)
+
+    _lines = [
+        f"**Claude Document Review** — NOLA: {_nola_file}, Ledger: {_ledger_file}",
+        "",
+        f"**NOLA Balance:** ${nola_bal:,.2f}",
+        f"**Ledger Pre-NOLA Net:** ${pre_nola_net:,.2f}",
+        f"**Match:** {'Yes' if match else f'No — discrepancy of ${discrepancy:,.2f}'}",
+        f"**Line Items Found:** {len(review.get('line_items', []))}",
+        f"**Delinquency Start:** {review.get('delinquency_start_date', 'Unknown')}",
+    ]
+    if flags:
+        _lines.append("")
+        _lines.append("**Flags:**")
+        for f in flags:
+            _lines.append(f"- {f}")
+    if warnings:
+        _lines.append("")
+        _lines.append("**Warnings:**")
+        for w in warnings:
+            _lines.append(f"- {w}")
+
+    return {
+        "status": "success",
+        "message": "\n".join(_lines),
+        "review": review,
+    }
+
+
 class FirstLetterRequest(BaseModel):
     entities: dict
     matter_id: Optional[str] = "#CC-8921"
@@ -1530,7 +1892,7 @@ async def _load_entities_from_uploads(
     def _classify(name: str) -> str:
         n = name.lower()
         if "nola" in n or "notice" in n:    return "nola"
-        if "ledger" in n or "palacios" in n: return "ledger"
+        if "ledger" in n or "account" in n or "statement" in n or "transaction" in n: return "ledger"
         if "affidavit" in n or "affid" in n: return "affidavit"
         return "nola"
 
@@ -1556,9 +1918,9 @@ async def _load_entities_from_uploads(
         if dtype in file_map:
             merged.update({k: v for k, v in file_map[dtype]["entities"].items() if v})
 
-    # Generic defaults — matter-specific values come from uploaded files via regex
-    merged.setdefault("association_name", "Segovia Condominium Association II, Inc.")
-    merged.setdefault("county",           "Miami-Dade")
+    # Generic defaults — matter-specific values come from uploaded files, never hardcoded
+    merged.setdefault("association_name", "Review Required")
+    merged.setdefault("county",           "")
     merged.setdefault("statute_type",     "718")
     merged.setdefault("entity_type",      "Condominium")
     merged.setdefault("cure_period_days", "30")
@@ -1811,11 +2173,12 @@ Do NOT write: a date, address block, Re: line, salutation, amount due table, lie
         )
 
     # Build DOCX
-    owner_last = owner.split()[-1] if owner not in ("Unit Owner", "Parcel Owner") else "Owner"
-    assoc_slug = "".join(c for c in assoc if c.isalnum())[:12]
+    # PRD §38.2: [AssocName]_[OwnerLastName]_[Unit]_[DocumentType]_[Version]_[YYYY-MM-DD]
+    owner_last = owner.split()[-1].title() if owner not in ("Unit Owner", "Parcel Owner") else "Owner"
+    assoc_slug = _re.sub(r"[^A-Za-z0-9]", "", assoc.split()[0]) if assoc.split() else "Assoc"
     unit_slug  = unit.replace(" ", "").replace("/", "-")
     date_slug  = datetime.date.today().strftime("%Y-%m-%d")
-    out_filename = f"{assoc_slug}_{owner_last}_{unit_slug}_FirstDemandLetter_v1_{date_slug}.docx"
+    out_filename = f"{assoc_slug}_{owner_last}_{unit_slug}_FirstDemand_{date_slug}.docx"
     out_path = OUTPUT_DIR / out_filename
 
     doc = Document()
@@ -1970,17 +2333,33 @@ async def generate_ledger(request: LedgerRequest):
             return default
 
     # ── Pull actual transactions from uploaded ledger files ──────────────────
+    # Match ledger files by owner/unit first, then fall back to generic keywords.
     line_items = list(request.line_items or [])
+    _raw_ledger_text = ""  # preserved for Claude review
     if not line_items:
-        for fp in sorted(UPLOAD_DIR.iterdir()):
-            if fp.suffix.lower() not in (".pdf", ".xlsx", ".xls", ".csv", ".docx"):
-                continue
-            n = fp.name.lower()
-            if any(kw in n for kw in ("ledger", "assessment", "transaction", "palacios", "account")):
-                raw = await asyncio.to_thread(extract_text_from_file, fp.read_bytes(), fp.name)
-                line_items = _parse_ledger_transactions(raw)
-                if line_items:
-                    break
+        _ledger_kws = ("ledger", "assessment", "transaction", "account", "statement")
+        _unit_slug_ledger  = (unit or "").replace(" ", "").replace("/", "").replace("-", "").lower()
+        _owner_last_ledger = owner.split()[-1].strip().lower() if owner not in ("Unknown Owner",) else ""
+        _all_ledger_cands = sorted(
+            [fp for fp in UPLOAD_DIR.iterdir()
+             if fp.suffix.lower() in (".pdf", ".xlsx", ".xls", ".csv", ".docx")
+             and any(kw in fp.name.lower() for kw in _ledger_kws)],
+            key=lambda fp: fp.stat().st_mtime,
+            reverse=True,
+        )
+        # Prefer ledger files that match this matter (unit or owner last name)
+        _matter_ledgers = [
+            fp for fp in _all_ledger_cands
+            if (_unit_slug_ledger and _unit_slug_ledger in fp.name.lower().replace(" ", "").replace("/", "").replace("-", ""))
+            or (_owner_last_ledger and _owner_last_ledger in fp.name.lower())
+        ]
+        _ledger_search_order = _matter_ledgers or _all_ledger_cands
+        for fp in _ledger_search_order:
+            raw = await asyncio.to_thread(extract_text_from_file, fp.read_bytes(), fp.name)
+            line_items = _parse_ledger_transactions(raw)
+            if line_items:
+                _raw_ledger_text = raw  # save for Claude review
+                break
 
     # ── Build placeholder rows from extracted financials if still empty ───────
     if not line_items:
@@ -2022,14 +2401,15 @@ async def generate_ledger(request: LedgerRequest):
 
     # ── Classify each row and compute per-type totals ────────────────────────
     TYPE_MAP = {
-        "Regular Assessment": "assessments",
-        "Previous Balance":   "assessments",
-        "Special Assessment": "assessments",
-        "Interest":           "interest",
-        "Late Fee":           "late_fees",
-        "Attorney Fee":       "atty_fees",
-        "Credit/Waiver":      "credits",
-        "Payment Received":   "credits",
+        "Regular Assessment":   "assessments",
+        "Previous Balance":     "assessments",
+        "Special Assessment":   "assessments",
+        "Projected Assessment": "assessments",
+        "Interest":             "interest",
+        "Late Fee":             "late_fees",
+        "Attorney Fee":         "atty_fees",
+        "Credit/Waiver":        "credits",
+        "Payment Received":     "credits",
     }
 
     def _build_ledger_rows_and_totals(items):
@@ -2096,12 +2476,81 @@ async def generate_ledger(request: LedgerRequest):
             _nola_candidates[0].name,
         )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CLAUDE DOCUMENT REVIEW — understand before generating
+    # ═══════════════════════════════════════════════════════════════════════════
+    # If Claude is available, send both the NOLA and ledger for AI review.
+    # Claude validates data, resolves dateless items, breaks down the NOLA
+    # balance, and returns a structured dataset.  If Claude is unavailable
+    # or fails, we fall back to the regex-based parsing already completed.
+    _claude_review = None
+    if _nola_text_ledger and _raw_ledger_text:
+        _claude_review = await _claude_review_documents(
+            nola_text=_nola_text_ledger,
+            ledger_text=_raw_ledger_text,
+            owner=owner,
+            unit=unit,
+            assoc=assoc,
+        )
+
+    # If Claude returned validated data, use it to replace regex-parsed items
+    if _claude_review and _claude_review.get("line_items"):
+        _cr = _claude_review
+        # Replace line_items with Claude's validated, date-resolved items
+        line_items = []
+        for _ci in _cr["line_items"]:
+            _charge = float(_ci.get("charge", 0) or 0)
+            _credit = float(_ci.get("credit", 0) or 0)
+            line_items.append({
+                "date":        _ci.get("date", ""),
+                "description": _ci.get("description", ""),
+                "type":        _ci.get("type", "Other"),
+                "charge":      _charge,
+                "credit":      _credit,
+                "payment":     _credit if _ci.get("type") == "Payment Received" else 0.0,
+                "notes":       _ci.get("notes", ""),
+                "is_pre_nola": _ci.get("is_pre_nola", False),
+                "is_relevant": _ci.get("is_relevant", True),
+                "original_description": _ci.get("original_description", ""),
+            })
+        # Rebuild totals from Claude-validated items
+        ledger_rows, totals = _build_ledger_rows_and_totals(line_items)
+        net_balance = round(
+            totals["assessments"] + totals["interest"] + totals["late_fees"]
+            + totals["atty_fees"] + totals["other"] - totals["credits"], 2
+        )
+        _claude_validation = _cr.get("validation", {})
+        print(f"[CondoClaw] Claude review: {len(line_items)} items validated, "
+              f"{len(_claude_validation.get('flags', []))} flags, "
+              f"NOLA match: {_claude_validation.get('nola_balance_match', 'unknown')}")
+
     # ── NOLA Ground Truth Anchor ──────────────────────────────────────────────
     # Per PRD: ledger starts from the NOLA date. The NOLA balance is the
     # authoritative opening balance. Transactions before the NOLA date are excluded.
     nola_date_anchor = None
     nola_balance_anchor = None
     nola_anchor_source = "none"
+    nola_charge_breakdown = {"assessments": 0, "interest": 0, "late_fees": 0, "atty_fees": 0, "other": 0}
+
+    # Use Claude's review for NOLA anchor if available
+    if _claude_review:
+        _cr_nola_date = _claude_review.get("nola_date", "")
+        if _cr_nola_date:
+            for _fmt in ("%m/%d/%Y", "%Y-%m-%d", "%B %d, %Y"):
+                try:
+                    nola_date_anchor = datetime.datetime.strptime(_cr_nola_date, _fmt).date()
+                    break
+                except (ValueError, AttributeError):
+                    pass
+        _cr_nola_bal = _claude_review.get("nola_balance")
+        if _cr_nola_bal and float(_cr_nola_bal) > 0:
+            nola_balance_anchor = float(_cr_nola_bal)
+            nola_anchor_source = "claude_review"
+        # NOLA breakdown from Claude
+        nola_charge_breakdown = _claude_review.get("nola_breakdown", {
+            "assessments": 0, "interest": 0, "late_fees": 0,
+            "atty_fees": 0, "other": 0,
+        })
 
     if _nola_text_ledger:
         # Extract NOLA date (try various formats)
@@ -2132,22 +2581,61 @@ async def generate_ledger(request: LedgerRequest):
                 except (ValueError, TypeError):
                     pass
 
-        # Fallback: sum of parsed NOLA line items
+        # Always parse NOLA line-item categories for the charge breakdown on Sheet 2
+        _nola_cats = _parse_nola_line_items(_nola_text_ledger)
+        _cat_sum = sum(float(v) for v in _nola_cats.values())
+
+        # Fallback: use line-item sum if no explicit total found
         if not nola_balance_anchor:
-            _nola_cats = _parse_nola_line_items(_nola_text_ledger)
-            _cat_sum = sum(float(v) for v in _nola_cats.values())
             if _cat_sum > 0:
                 nola_balance_anchor = _cat_sum
                 nola_anchor_source = "line_item_sum"
 
+        # NOLA charge breakdown for Sheet 2 NOLA row (maps to charge columns)
+        # maintenance + special_assessments → Assessments, late_fees → Late Fees,
+        # other_charges → Other.  Interest extracted separately below.
+        _nola_interest = 0.0
+        for _iline in _nola_text_ledger.split("\n"):
+            _iline_lc = _iline.strip().lower()
+            if any(kw in _iline_lc for kw in ("interest",)) and not any(
+                kw in _iline_lc for kw in ("total", "balance", "please", "remit")
+            ):
+                _im = _re.search(r"\$\s*([\d,]+\.\d{2})", _iline)
+                if not _im:
+                    _im = _re.search(r"\b([\d,]+\.\d{2})\s*$", _iline)
+                if _im:
+                    try:
+                        _nola_interest = float(_im.group(1).replace(",", ""))
+                    except (ValueError, TypeError):
+                        pass
+                    break
+
+        nola_charge_breakdown = {
+            "assessments": float(_nola_cats.get("maintenance", 0)) + float(_nola_cats.get("special_assessments", 0)),
+            "interest":    _nola_interest,
+            "late_fees":   float(_nola_cats.get("late_fees", 0)),
+            "atty_fees":   0.0,   # attorney fees from NOLA are skipped per policy
+            "other":       float(_nola_cats.get("other_charges", 0)),
+        }
+
     # Save raw snapshot for Association Ledger sheet (before NOLA filter)
     raw_line_items = list(line_items)
 
-    # Filter line_items to post-NOLA only and prepend NOLA opening balance row
+    # Filter line_items into pre-NOLA and post-NOLA; prepend NOLA opening balance row
     nola_consistency_flag = None
+    pre_nola_items = []   # FULL ledger history before NOLA — dump everything, highlight relevance
     if nola_date_anchor and line_items:
         _post_nola = []
+        _pre_nola  = []
         for _t in line_items:
+            # If Claude already flagged this as pre/post NOLA, use that
+            if _t.get("is_pre_nola") is not None:
+                if _t["is_pre_nola"]:
+                    _pre_nola.append(_t)
+                else:
+                    _post_nola.append(_t)
+                continue
+            # Otherwise, determine by date
             _td = None
             for _fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
                 try:
@@ -2155,8 +2643,35 @@ async def generate_ledger(request: LedgerRequest):
                     break
                 except (ValueError, AttributeError):
                     pass
-            if _td is None or _td > nola_date_anchor:
+            # Dateless items: "Previous Balance" / "Balance Forward" are historical,
+            # NOT post-NOLA.  Assign them to pre-NOLA.
+            if _td is None:
+                _desc_lc = str(_t.get("description", "")).lower()
+                if any(kw in _desc_lc for kw in ("previous balance", "balance forward",
+                                                    "balance fwd", "opening balance")):
+                    _pre_nola.append(_t)
+                else:
+                    _post_nola.append(_t)  # truly unknown → post-NOLA as fallback
+            elif _td > nola_date_anchor:
                 _post_nola.append(_t)
+            else:
+                _pre_nola.append(_t)
+
+        # Dump FULL pre-NOLA history — no trimming.
+        # Mark relevance: items where running balance was at zero or credit are "irrelevant"
+        # (account was current). Items after delinquency start are "relevant".
+        _mark_running = 0.0
+        _last_zero_idx = -1
+        for _pi, _pt in enumerate(_pre_nola):
+            _pc = _to_float(_pt.get("charge", 0))
+            _pr = _to_float(_pt.get("credit", 0))
+            _mark_running = round(_mark_running + _pc - _pr, 2)
+            if _mark_running <= 0:
+                _last_zero_idx = _pi
+        for _pi, _pt in enumerate(_pre_nola):
+            if "is_relevant" not in _pt:
+                _pt["is_relevant"] = (_pi > _last_zero_idx)
+        pre_nola_items = _pre_nola
 
         if nola_balance_anchor:
             _nola_row = {
@@ -2168,9 +2683,11 @@ async def generate_ledger(request: LedgerRequest):
                 "type": "Previous Balance",
                 "charge": nola_balance_anchor,
                 "credit": 0.0,
+                "payment": 0.0,
                 "balance": nola_balance_anchor,
                 "notes": "NOLA ground truth opening balance — do not modify",
                 "group": "NOLA Opening Balance",
+                "nola_breakdown": nola_charge_breakdown,
             }
             line_items = [_nola_row] + _post_nola
         else:
@@ -2347,11 +2864,14 @@ async def generate_ledger(request: LedgerRequest):
         ]
 
     # ── Write Excel ──────────────────────────────────────────────────────────
-    owner_last   = owner.split()[-1] if owner not in ("Unknown Owner",) else "Owner"
-    assoc_slug   = "".join(c for c in assoc if c.isalnum())[:12]
+    # PRD §38.2: [AssocName]_[OwnerLastName]_[Unit]_[DocumentType]_[Version]_[YYYY-MM-DD]
+    owner_last   = owner.split()[-1].title() if owner not in ("Unknown Owner",) else "Owner"
+    assoc_slug   = _re.sub(r"[^A-Za-z0-9]", "", assoc.split()[0]) if assoc.split() else "Assoc"
     unit_slug    = unit.replace(" ", "").replace("/", "-")
-    out_filename = f"{assoc_slug}_{owner_last}_{unit_slug}_AuditLedger_v1_{today_str}.xlsx"
+    out_filename = f"{assoc_slug}_{owner_last}_{unit_slug}_Ledger_{today_str}.xlsx"
     out_path     = OUTPUT_DIR / out_filename
+
+    _assembled_nl_rows = []  # populated by _build_excel for post-review
 
     def _build_excel():
         navy    = PatternFill(start_color="1B2A4A", end_color="1B2A4A", fill_type="solid")
@@ -2370,10 +2890,10 @@ async def generate_ledger(request: LedgerRequest):
             ledger_cols = [
                 "#", "Date", "Description", "Type",
                 "Assessments ($)", "Interest ($)", "Late Fees ($)",
-                "Atty Fees ($)", "Other ($)", "Credits ($)",
+                "Atty Fees ($)", "Other ($)", "Payments ($)", "Credits ($)",
                 "Running Balance ($)", "Notes",
             ]
-            col_widths = [5, 13, 42, 20, 16, 14, 14, 14, 12, 12, 20, 22]
+            col_widths = [5, 13, 42, 20, 16, 14, 14, 14, 12, 14, 12, 20, 22]
 
             # ── Sheet 1: Statement of Account ─────────────────────────────────
             # Per PRD §5.1 — SOA is always first. All amounts derive from the
@@ -2450,43 +2970,129 @@ async def generate_ledger(request: LedgerRequest):
                 _nc.font = Font(italic=True, size=8)
 
             # ── Sheet 2: NOLA-Ledger ──────────────────────────────────────────
-            # NOLA as locked opening row, post-NOLA charges by category,
-            # 45-day forward projection. PRD §42.2, §42.6
-            nola_ledger_items = list(line_items)
-            if _projection_rows:
-                nola_ledger_items.append({
-                    "date": "", "description": "── 45-DAY FORWARD PROJECTION (PRD §42.6) ──",
-                    "type": "Separator", "charge": 0.0, "credit": 0.0,
-                    "notes": "Projected charges — 45-day cure window",
-                })
-                nola_ledger_items.extend(_projection_rows)
+            # Structure: pre-NOLA history → NOLA anchor (yellow) → post-NOLA
+            # charges by category → 45-day projection.  PRD §42.2, §42.6
+            #
+            # Pre-NOLA rows show the ledger history the NOLA balance is based on.
+            # NOLA row is the authoritative anchor. Post-NOLA rows are accruals.
+            # Running balance column (K) uses Excel formulas throughout.
 
+            # ---- helper: clean redundant parenthetical from description ----
+            def _clean_desc(raw):
+                _paren_m = _re.match(r'^(.+?)\s*\((.+)\)\s*$', raw)
+                if _paren_m:
+                    _d_core = _re.sub(r'[\d\s]+$', '', _paren_m.group(1)).strip().lower()
+                    _g_core = _re.sub(r'[\d\s]+$', '', _paren_m.group(2)).strip().lower()
+                    if _d_core and _g_core and (_d_core.startswith(_g_core) or _g_core.startswith(_d_core)):
+                        return _paren_m.group(1).strip()
+                return raw
+
+            # ---- helper: split a transaction into the 13-column row --------
+            # Columns: #, Date, Desc, Type, Assessments(E), Interest(F),
+            #          Late Fees(G), Atty Fees(H), Other(I), Payments(J),
+            #          Credits(K), Running Balance(L), Notes(M)
+            def _make_split_row(idx, item, is_nola_anchor=False):
+                _charge = _to_float(item.get("charge", 0))
+                _credit = _to_float(item.get("credit", 0))
+                _payment = _to_float(item.get("payment", 0))
+                _rtype  = item.get("type", "Other")
+                _is_sep = _rtype == "Separator"
+                _bkt    = TYPE_MAP.get(_rtype, "other")
+                # Determine if this is a payment vs a credit/waiver
+                _is_payment = _rtype in ("Payment Received",)
+                _is_credit  = _rtype in ("Credit/Waiver",) or (_credit > 0 and not _is_payment)
+                def _cv(val, cond):
+                    if _is_sep: return ""
+                    return round(val, 2) if cond and val else 0.00
+                desc = _clean_desc(item.get("description", ""))
+                if is_nola_anchor:
+                    # Charge columns E–K will be replaced with SUM formulas
+                    # over the relevant pre-NOLA rows (injected after pandas write).
+                    # Running Balance (L) will also be a formula.
+                    return [idx, item.get("date", ""), desc, _rtype,
+                            0.0, 0.0, 0.0, 0.0, 0.0,  # E–I: placeholders for SUM formulas
+                            0.0, 0.0,                    # J–K: Payments, Credits
+                            0.0,                          # L: Running Balance placeholder
+                            item.get("notes", "")]
+                return ["" if _is_sep else idx,
+                        item.get("date", ""),
+                        desc, _rtype,
+                        _cv(_charge, _bkt == "assessments"),
+                        _cv(_charge, _bkt == "interest"),
+                        _cv(_charge, _bkt == "late_fees"),
+                        _cv(_charge, _bkt == "atty_fees"),
+                        _cv(_charge, _bkt == "other"),
+                        _cv(_credit, _is_payment),     # Payments (J)
+                        _cv(_credit, _is_credit),       # Credits (K)
+                        0.0,  # Running Balance placeholder — replaced by formula
+                        item.get("notes", "")]
+
+            # ---- assemble all rows in order --------------------------------
             nl_split_rows = []
-            _nl_running   = 0.0
-            for _nl_idx, _nl_row in enumerate(nola_ledger_items, 1):
-                _charge  = _to_float(_nl_row.get("charge", 0))
-                _credit  = _to_float(_nl_row.get("credit", 0))
-                _rtype   = _nl_row.get("type", "Other")
-                _is_sep  = _rtype == "Separator"
-                _is_proj = _rtype == "Projected Assessment"
-                if not _is_sep:
-                    _nl_running = round(_nl_running + _charge - _credit, 2)
-                _bkt = TYPE_MAP.get(_rtype, "other")
-                nl_split_rows.append([
-                    "" if _is_sep else _nl_idx,
-                    _nl_row.get("date", ""),
-                    _nl_row.get("description", ""),
-                    _rtype,
-                    _charge if _bkt == "assessments" and not _is_sep else "",
-                    _charge if _bkt == "interest"    and not _is_sep else "",
-                    _charge if _bkt == "late_fees"   and not _is_sep else "",
-                    _charge if _bkt == "atty_fees"   and not _is_sep else "",
-                    _charge if (_is_proj or _bkt == "other") and not _is_sep else "",
-                    _credit if _credit > 0           and not _is_sep else "",
-                    "" if _is_sep else _nl_running,
-                    _nl_row.get("notes", ""),
-                ])
+            # Track section boundaries (indices into nl_split_rows)
+            _nola_anchor_idx = None  # index of NOLA row in nl_split_rows
+            _pre_nola_count  = 0
+            _row_counter     = 1
 
+            # Section A: Pre-NOLA history from uploaded ledger
+            if pre_nola_items:
+                # Separator: pre-NOLA context header
+                nl_split_rows.append([
+                    "", "", "── PRE-NOLA LEDGER HISTORY ──", "Separator",
+                    "", "", "", "", "", "", "", "", "Context: charges leading to NOLA balance"
+                ])
+                _pre_nola_count += 1
+                for _pn in pre_nola_items:
+                    nl_split_rows.append(_make_split_row(_row_counter, _pn))
+                    _row_counter += 1
+                    _pre_nola_count += 1
+
+            # Section B: NOLA anchor row (from line_items[0] which is the NOLA row)
+            for _li in line_items:
+                _is_nola_anchor = "NOLA ground truth" in str(_li.get("notes", ""))
+                if _is_nola_anchor:
+                    _nola_anchor_idx = len(nl_split_rows)
+                    nl_split_rows.append(_make_split_row(_row_counter, _li, is_nola_anchor=True))
+                    _row_counter += 1
+                    break
+
+            # Section C: Post-NOLA transactions (everything in line_items after NOLA row)
+            _found_nola = False
+            for _li in line_items:
+                if "NOLA ground truth" in str(_li.get("notes", "")):
+                    _found_nola = True
+                    continue
+                if _found_nola:
+                    nl_split_rows.append(_make_split_row(_row_counter, _li))
+                    _row_counter += 1
+
+            # Section D-pre: Current Balance row (before projections)
+            # This row shows the running balance as of the latest ledger entry,
+            # which should be consistent with the uploaded ledger total.
+            _current_bal_idx = len(nl_split_rows)
+            nl_split_rows.append([
+                "", "", "CURRENT BALANCE (per ledger)", "Current Balance",
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0,  # placeholder — will be formula referencing last post-NOLA row
+                "Should match uploaded ledger balance"
+            ])
+
+            # Section D: 45-day forward projections
+            if _projection_rows:
+                nl_split_rows.append([
+                    "", "", "── 45-DAY FORWARD PROJECTION (PRD §42.6) ──",
+                    "Separator", "", "", "", "", "", "", "", "",
+                    "Projected charges — 45-day cure window"
+                ])
+                for _pr in _projection_rows:
+                    nl_split_rows.append(_make_split_row(_row_counter, _pr))
+                    _row_counter += 1
+
+            # ---- Store assembled rows for post-review (run outside _build_excel) ─
+            nonlocal _assembled_nl_rows
+            _assembled_nl_rows = list(nl_split_rows)
+
+            # ---- write via pandas then enhance with formulas ---------------
             df_nl = pd.DataFrame(nl_split_rows, columns=ledger_cols)
             df_nl.to_excel(writer, sheet_name="NOLA-Ledger", index=False)
             ws_nl = writer.sheets["NOLA-Ledger"]
@@ -2497,19 +3103,139 @@ async def generate_ledger(request: LedgerRequest):
                 cell.fill      = navy
                 cell.border    = thin
                 cell.alignment = Alignment(horizontal="center", wrap_text=True)
-            _proj_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-            _sep_fill  = PatternFill(start_color="1B2A4A", end_color="1B2A4A", fill_type="solid")
+
+            # ---- inject Excel formulas ----------------------------------------
+            # Column layout: E=5 Assessments, F=6 Interest, G=7 Late Fees,
+            #   H=8 Atty Fees, I=9 Other, J=10 Payments, K=11 Credits,
+            #   L=12 Running Balance, M=13 Notes
+            _RB_COL = 12   # Running Balance column number (L)
+            _RB_LET = "L"  # Running Balance column letter
+            _CHARGE_FORMULA = "E{r}+F{r}+G{r}+H{r}+I{r}-J{r}-K{r}"
+            _nola_excel_row = (_nola_anchor_idx + 2) if _nola_anchor_idx is not None else None
+
+            # Determine the range of RELEVANT pre-NOLA data rows for the NOLA SUM.
+            # Only relevant rows (delinquency period) are included — irrelevant rows
+            # (when account was current/zero balance) are excluded from the SUM.
+            # Relevant rows form a contiguous block from delinquency start to NOLA date.
+            _relevant_start_xl = None  # first RELEVANT pre-NOLA data row (Excel row)
+            _relevant_end_xl   = None  # last RELEVANT pre-NOLA data row (Excel row)
+            _pre_item_counter  = 0
+            if _pre_nola_count > 1 and _nola_anchor_idx is not None:
+                for _pi in range(len(nl_split_rows)):
+                    if _pi >= _nola_anchor_idx:
+                        break
+                    _pt = str(nl_split_rows[_pi][3] if len(nl_split_rows[_pi]) > 3 else "")
+                    if _pt != "Separator":
+                        # Check if this pre-NOLA item is relevant
+                        _is_rel = True
+                        if _pre_item_counter < len(pre_nola_items):
+                            _is_rel = pre_nola_items[_pre_item_counter].get("is_relevant", True)
+                        _pre_item_counter += 1
+                        if _is_rel:
+                            _xl_pi = _pi + 2
+                            if _relevant_start_xl is None:
+                                _relevant_start_xl = _xl_pi
+                            _relevant_end_xl = _xl_pi
+
+            _current_bal_excel_row = _current_bal_idx + 2  # Excel row for Current Balance
+
+            for _di, _srow in enumerate(nl_split_rows):
+                _xl_row = _di + 2   # Excel row (1-based, header is row 1)
+                _rtype  = str(_srow[3] if len(_srow) > 3 else "")
+                if _rtype == "Separator":
+                    continue  # no formula for separator rows
+
+                _is_this_nola = (_di == _nola_anchor_idx)
+                _is_current_bal = (_rtype == "Current Balance")
+
+                if _is_current_bal:
+                    # Current Balance row: SUM formulas from NOLA row to the row before this
+                    _cb_start = _nola_excel_row if _nola_excel_row else 2
+                    _cb_end   = _xl_row - 1
+                    _charge_cols_cb = {5: "E", 6: "F", 7: "G", 8: "H", 9: "I", 10: "J", 11: "K"}
+                    for _cn, _cl in _charge_cols_cb.items():
+                        _fc = ws_nl.cell(row=_xl_row, column=_cn,
+                                         value=f"=SUM({_cl}{_cb_start}:{_cl}{_cb_end})")
+                        _fc.number_format = '#,##0.00'
+                    # Running Balance = last post-NOLA row's running balance
+                    _prev_data_row = _xl_row - 1
+                    _kc = ws_nl.cell(row=_xl_row, column=_RB_COL,
+                                     value=f"={_RB_LET}{_prev_data_row}")
+                    _kc.number_format = '"$"#,##0.00'
+                    continue
+
+                if _is_this_nola:
+                    # ── NOLA row: charge columns E–K use SUM over RELEVANT pre-NOLA rows ──
+                    # Only sums the delinquency period, not the entire history.
+                    if _relevant_start_xl and _relevant_end_xl:
+                        _charge_cols = {5: "E", 6: "F", 7: "G", 8: "H", 9: "I", 10: "J", 11: "K"}
+                        for _cn, _cl in _charge_cols.items():
+                            _fc = ws_nl.cell(row=_xl_row, column=_cn,
+                                             value=f"=SUM({_cl}{_relevant_start_xl}:{_cl}{_relevant_end_xl})")
+                            _fc.number_format = '#,##0.00'
+                    # Running Balance = sum of charges - payments - credits on this row
+                    _kc = ws_nl.cell(row=_xl_row, column=_RB_COL,
+                                     value=f"={_CHARGE_FORMULA.format(r=_xl_row)}")
+                elif _di == 1 and _pre_nola_count > 0 and _rtype != "Separator":
+                    # First actual pre-NOLA data row (after separator)
+                    _kc = ws_nl.cell(row=_xl_row, column=_RB_COL,
+                                     value=f"={_CHARGE_FORMULA.format(r=_xl_row)}")
+                elif _nola_excel_row and _xl_row == _nola_excel_row + 1 and not _is_this_nola:
+                    # First post-NOLA row: L = NOLA balance + this row's net
+                    _kc = ws_nl.cell(row=_xl_row, column=_RB_COL,
+                                     value=f"={_RB_LET}{_nola_excel_row}+{_CHARGE_FORMULA.format(r=_xl_row)}")
+                else:
+                    # All other rows: L = L(prev non-separator) + charges - payments - credits
+                    _prev_xl = _xl_row - 1
+                    while _prev_xl >= 2:
+                        _prev_di = _prev_xl - 2
+                        if 0 <= _prev_di < len(nl_split_rows):
+                            if str(nl_split_rows[_prev_di][3] if len(nl_split_rows[_prev_di]) > 3 else "") != "Separator":
+                                break
+                        _prev_xl -= 1
+                    if _prev_xl >= 2:
+                        _kc = ws_nl.cell(row=_xl_row, column=_RB_COL,
+                                         value=f"={_RB_LET}{_prev_xl}+{_CHARGE_FORMULA.format(r=_xl_row)}")
+                    else:
+                        _kc = ws_nl.cell(row=_xl_row, column=_RB_COL,
+                                         value=f"={_CHARGE_FORMULA.format(r=_xl_row)}")
+                _kc.number_format = '"$"#,##0.00'
+
+            # ---- formatting pass -------------------------------------------
+            _proj_fill          = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+            _sep_fill           = PatternFill(start_color="1B2A4A", end_color="1B2A4A", fill_type="solid")
+            _pre_relevant_fill  = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")  # light gray: relevant pre-NOLA
+            _pre_irrelevant_fill= PatternFill(start_color="E8E8E8", end_color="E8E8E8", fill_type="solid")  # darker gray: irrelevant (account current)
+            _nola_fill          = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+            # Build a map of pre-NOLA item relevance for formatting
+            _pre_nola_relevance = {}
+            _pre_item_idx = 0
+            for _di_fmt, _srow_fmt in enumerate(nl_split_rows):
+                if _di_fmt < (_nola_anchor_idx or 0) and str(_srow_fmt[3] if len(_srow_fmt) > 3 else "") != "Separator":
+                    if _pre_item_idx < len(pre_nola_items):
+                        _pre_nola_relevance[_di_fmt] = pre_nola_items[_pre_item_idx].get("is_relevant", True)
+                        _pre_item_idx += 1
+
             for row in ws_nl.iter_rows(min_row=2, max_row=ws_nl.max_row):
-                _desc_v  = str(row[2].value or "")
-                _type_v  = str(row[3].value or "")
+                _xl_r   = row[0].row
+                _di     = _xl_r - 2
+                _desc_v = str(row[2].value or "")
+                _type_v = str(row[3].value or "")
                 _is_nola = "Balance per Notice of Late Assessment" in _desc_v
                 _is_sep  = _type_v == "Separator"
                 _is_proj = _type_v == "Projected Assessment"
+                _is_cur_bal = _type_v == "Current Balance"
+                _is_pre  = (_di < (_nola_anchor_idx or 0)) and not _is_sep
+                _is_relevant = _pre_nola_relevance.get(_di, True)
                 for cell in row:
                     cell.border    = thin
                     cell.alignment = Alignment(vertical="center")
-                    if _is_nola:
-                        cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                    if _is_cur_bal:
+                        cell.fill = PatternFill(start_color="B4C6E7", end_color="B4C6E7", fill_type="solid")
+                        cell.font = Font(bold=True, size=10, color="1B2A4A")
+                    elif _is_nola:
+                        cell.fill = _nola_fill
                         cell.font = Font(bold=True, size=10)
                     elif _is_sep:
                         cell.fill      = _sep_fill
@@ -2518,42 +3244,59 @@ async def generate_ledger(request: LedgerRequest):
                     elif _is_proj:
                         cell.fill = _proj_fill
                         cell.font = Font(italic=True, size=9)
+                    elif _is_pre and _is_relevant:
+                        cell.fill = _pre_relevant_fill
+                        cell.font = Font(size=9, color="444444")
+                    elif _is_pre and not _is_relevant:
+                        cell.fill = _pre_irrelevant_fill
+                        cell.font = Font(size=9, color="999999", italic=True)
 
-            # Totals row
-            _nl_tot_row = ws_nl.max_row + 1
-            _nl_tot_vals = [
-                "", "", "TOTALS", "",
-                totals["assessments"] or "",
-                totals["interest"]    or "",
-                totals["late_fees"]   or "",
-                totals["atty_fees"]   or "",
-                totals["other"]       or "",
-                totals["credits"]     or "",
-                net_balance, "",
-            ]
-            for _ci, _cv in enumerate(_nl_tot_vals, 1):
-                _tc = ws_nl.cell(row=_nl_tot_row, column=_ci, value=_cv)
-                _tc.font      = Font(bold=True, size=11)
-                _tc.fill      = gold
-                _tc.border    = thin
-                _tc.alignment = Alignment(horizontal="center")
+            # ---- Totals row — SUM formulas from NOLA row onward ------------
+            _nl_last_data = ws_nl.max_row
+            _nl_tot_row   = _nl_last_data + 1
+            # SUM range starts at NOLA anchor row (excludes pre-NOLA history)
+            _sum_start = _nola_excel_row if _nola_excel_row else 2
+            # Column mapping: E=5 Assessments, F=6 Interest, G=7 Late Fees,
+            #   H=8 Atty Fees, I=9 Other, J=10 Payments, K=11 Credits
+            _sum_cols = {5: "E", 6: "F", 7: "G", 8: "H", 9: "I", 10: "J", 11: "K"}
+            _nl_tot_static = ["", "", "TOTALS", ""]
+            for _ci, _sv in enumerate(_nl_tot_static, 1):
+                _tc = ws_nl.cell(row=_nl_tot_row, column=_ci, value=_sv)
+                _tc.font = Font(bold=True, size=11); _tc.fill = gold
+                _tc.border = thin; _tc.alignment = Alignment(horizontal="center")
+            for _col_n, _col_l in _sum_cols.items():
+                _tc = ws_nl.cell(row=_nl_tot_row, column=_col_n,
+                                 value=f"=SUM({_col_l}{_sum_start}:{_col_l}{_nl_last_data})")
+                _tc.number_format = '#,##0.00'
+                _tc.font = Font(bold=True, size=11); _tc.fill = gold
+                _tc.border = thin; _tc.alignment = Alignment(horizontal="center")
+            # L = Running Balance = last data row's running balance
+            _tc_l = ws_nl.cell(row=_nl_tot_row, column=_RB_COL,
+                               value=f"={_RB_LET}{_nl_last_data}")
+            _tc_l.number_format = '"$"#,##0.00'
+            _tc_l.font = Font(bold=True, size=11); _tc_l.fill = gold
+            _tc_l.border = thin; _tc_l.alignment = Alignment(horizontal="center")
+            ws_nl.cell(row=_nl_tot_row, column=13).border = thin  # Notes col border
 
-            # Summary block
+            # ---- Summary block — formulas referencing the TOTALS row -------
             _nl_sum_start = _nl_tot_row + 2
             _nl_cheat = [
-                ("TOTALS SUMMARY", ""),
-                ("Total Assessments",   f"${totals['assessments']:.2f}"),
-                ("Total Interest",      f"${totals['interest']:.2f}"),
-                ("Total Late Fees",     f"${totals['late_fees']:.2f}"),
-                ("Total Attorney Fees", f"${totals['atty_fees']:.2f}"),
-                ("Total Other",         f"${totals['other']:.2f}" if totals["other"] else "$0.00"),
-                ("Total Credits",       f"-${totals['credits']:.2f}" if totals["credits"] else "$0.00"),
-                ("NET BALANCE DUE",     f"${net_balance:.2f}"),
+                ("TOTALS SUMMARY",       ""),
+                ("Total Assessments",    f"=E{_nl_tot_row}"),
+                ("Total Interest",       f"=F{_nl_tot_row}"),
+                ("Total Late Fees",      f"=G{_nl_tot_row}"),
+                ("Total Attorney Fees",  f"=H{_nl_tot_row}"),
+                ("Total Other Charges",  f"=I{_nl_tot_row}"),
+                ("Total Payments",       f"=-J{_nl_tot_row}"),
+                ("Total Credits",        f"=-K{_nl_tot_row}"),
+                ("NET BALANCE DUE",      f"={_RB_LET}{_nl_tot_row}"),
             ]
             for _ro, (_lbl, _lv) in enumerate(_nl_cheat):
                 _r    = _nl_sum_start + _ro
                 _cl   = ws_nl.cell(row=_r, column=1, value=_lbl)
                 _cv2  = ws_nl.cell(row=_r, column=2, value=_lv)
+                if _lv and str(_lv).startswith("="):
+                    _cv2.number_format = '"$"#,##0.00'
                 _hdr  = _lbl in ("TOTALS SUMMARY", "NET BALANCE DUE")
                 for _c in (_cl, _cv2):
                     _c.border = thin
@@ -2573,6 +3316,7 @@ async def generate_ledger(request: LedgerRequest):
                 _al_running = round(_al_running + _ac - _ar, 2)
                 _at  = _al_row.get("type", "Other")
                 _abk = TYPE_MAP.get(_at, "other")
+                _al_is_payment = _at in ("Payment Received",)
                 al_split_rows.append([
                     _al_idx,
                     _al_row.get("date", ""),
@@ -2583,7 +3327,8 @@ async def generate_ledger(request: LedgerRequest):
                     _ac if _abk == "late_fees"   else "",
                     _ac if _abk == "atty_fees"   else "",
                     _ac if _abk == "other"       else "",
-                    _ar if _ar > 0               else "",
+                    _ar if _al_is_payment        else "",   # Payments
+                    _ar if (_ar > 0 and not _al_is_payment) else "",  # Credits
                     _al_running,
                     _al_row.get("notes", ""),
                 ])
@@ -2779,7 +3524,27 @@ async def generate_ledger(request: LedgerRequest):
 
     await asyncio.to_thread(_build_excel)
 
-    _record_generated(out_filename, out_path, "audit_ledger",
+    # ── Claude Post-Generation Review (Step 2) ────────────────────────────
+    # Claude reviews the generated output like an attorney paired legal review.
+    _post_review = None
+    if _nola_text_ledger and _raw_ledger_text and _assembled_nl_rows:
+        _post_review = await _claude_post_review(
+            nola_text=_nola_text_ledger,
+            ledger_text=_raw_ledger_text,
+            generated_rows=_assembled_nl_rows,
+            nola_balance=nola_balance_anchor or 0,
+            owner=owner,
+            unit=unit,
+        )
+        if _post_review:
+            _pr_status = _post_review.get("status", "unknown")
+            _pr_issues = _post_review.get("issues", [])
+            _pr_errors = [i for i in _pr_issues if i.get("severity") == "error"]
+            print(f"[CondoClaw] Post-review: status={_pr_status}, "
+                  f"{len(_pr_issues)} issues ({len(_pr_errors)} errors), "
+                  f"discrepancy=${_post_review.get('discrepancy', 0):,.2f}")
+
+    _record_generated(out_filename, out_path, "ledger",
                       request.matter_id or "#CC-0000", owner, unit, list(e.keys()))
 
     return {
@@ -2788,6 +3553,7 @@ async def generate_ledger(request: LedgerRequest):
         "totals": {k: round(v, 2) for k, v in totals.items()},
         "net_balance": net_balance,
         "transactions": len(line_items),
+        "post_review": _post_review,
     }
 
 
@@ -2815,11 +3581,43 @@ def health_check():
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
+    # ── Prefer Claude (Anthropic) for chat when API key is available ──────
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    if anthropic_key and HAS_ANTHROPIC:
+        try:
+            _claude_client = anthropic.Anthropic(api_key=anthropic_key)
+            _claude_msgs = []
+            for msg in request.messages:
+                if msg.content and msg.content.strip():
+                    _claude_msgs.append({
+                        "role": "user" if msg.role == "user" else "assistant",
+                        "content": msg.content,
+                    })
+            if not _claude_msgs:
+                _claude_msgs = [{"role": "user", "content": "Hello"}]
+            _claude_response = await asyncio.to_thread(
+                _claude_client.messages.create,
+                model="claude-sonnet-4-20250514",
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                messages=_claude_msgs,
+            )
+            return {
+                "error": False,
+                "response": _claude_response.content[0].text,
+                "content": _claude_response.content[0].text,
+                "model": "claude-sonnet-4",
+                "actual_model": "claude-sonnet-4-20250514",
+            }
+        except Exception as e:
+            print(f"[CondoClaw] Claude chat error: {e}, falling back to Gemini")
+
+    # ── Fallback to Gemini ────────────────────────────────────────────────
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         return {
             "error": False,
-            "content": "⚠️ **GOOGLE_API_KEY not configured.** Please create a `.env` file in the project root with:\n\n```\nGOOGLE_API_KEY=your-key-here\n```\n\nOnce set, restart the backend server and I'll be fully functional!",
+            "content": "Configure ANTHROPIC_API_KEY (preferred) or GOOGLE_API_KEY in .env to enable the AI Concierge chat.",
             "model": request.model,
         }
 
@@ -2965,7 +3763,7 @@ async def generate_ground_truth(
         n = name.lower()
         if "nola" in n or "notice" in n:
             return "nola"
-        if "ledger" in n or "palacios" in n:
+        if "ledger" in n or "account" in n or "statement" in n or "transaction" in n:
             return "ledger"
         if "affidavit" in n or "affid" in n:
             return "affidavit"
@@ -3004,39 +3802,26 @@ async def generate_ground_truth(
         if dtype in file_map:
             merged.update({k: v for k, v in file_map[dtype]["entities"].items() if v})
 
-    # Defaults for Segovia / Jenny Palacios based on ground truth
-    merged.setdefault("association_name", "Segovia Condominium Association II, Inc.")
-    merged.setdefault("owner_name", "Jenny Palacios Pacheco")
-    merged.setdefault("unit_number", "308")
-    merged.setdefault("property_address", "1221 SW 122 Ave, Unit 308, Miami, FL 33185")
-    merged.setdefault("county", "Miami-Dade")
+    # Generic defaults — populated from uploaded documents, never hardcoded to a specific matter
+    merged.setdefault("association_name", "Review Required")
+    merged.setdefault("owner_name", "Review Required")
+    merged.setdefault("unit_number", "—")
+    merged.setdefault("property_address", "Review Required")
+    merged.setdefault("county", "")
     merged.setdefault("statute_type", "718")
     merged.setdefault("entity_type", "Condominium")
     merged.setdefault("cure_period_days", "30")
-    merged.setdefault("nola_date", "01/26/2026")
-    merged.setdefault("monthly_assessment", "458.00")
+    merged.setdefault("monthly_assessment", "0")
 
     # ------------------------------------------------------------------ #
     # 3. Build transaction table from real ledger data
     # ------------------------------------------------------------------ #
     transactions = file_map.get("ledger", {}).get("transactions", [])
 
-    # If parser found nothing, build from known ground truth
+    # If parser found nothing, leave transactions empty — never use hardcoded sample data
     if not transactions:
-        transactions = [
-            {"date": "01/01/2026", "description": "Previous Balance — Delinquent Fee 2025",
-             "type": "Previous Balance", "charge": 135.39, "credit": 0.0, "balance": 135.39, "group": "Delinquent Fee 2025"},
-            {"date": "01/01/2026", "description": "Waiver — Delinquent Fee 2025",
-             "type": "Credit/Waiver", "charge": 0.0, "credit": 135.39, "balance": 0.0, "group": "Delinquent Fee 2025"},
-            {"date": "01/01/2026", "description": "Previous Balance — Homeowner 2025",
-             "type": "Previous Balance", "charge": 3211.32, "credit": 0.0, "balance": 3211.32, "group": "Homeowner 2025"},
-            {"date": "02/10/2026", "description": "eCheck Payment — Homeowner 2025",
-             "type": "Payment Received", "charge": 0.0, "credit": 1900.00, "balance": 1311.32, "group": "Homeowner 2025"},
-            {"date": "01/01/2026", "description": "Regular Assessment — Homeowner 2026",
-             "type": "Regular Assessment", "charge": 458.00, "credit": 0.0, "balance": 458.00, "group": "Homeowner 2026"},
-            {"date": "02/01/2026", "description": "Regular Assessment — Homeowner 2026",
-             "type": "Regular Assessment", "charge": 458.00, "credit": 0.0, "balance": 916.00, "group": "Homeowner 2026"},
-        ]
+        print("[CondoClaw] WARNING: No transactions parsed from uploaded ledger. "
+              "Upload a ledger file to generate accurate financial data.")
 
     # ------------------------------------------------------------------ #
     # 4. Calculate financials — per-installment simple interest
@@ -3064,7 +3849,7 @@ async def generate_ground_truth(
     interest_accrued   = delinquency["interest"]
     late_fee           = delinquency["late_fees"]
 
-    nola_date_str   = merged.get("nola_date", "01/26/2026")
+    nola_date_str   = merged.get("nola_date", datetime.date.today().strftime("%m/%d/%Y"))
     days_since_nola = 0
     try:
         _nola_dt_leg = datetime.datetime.strptime(nola_date_str, "%m/%d/%Y").date()
@@ -3160,10 +3945,10 @@ async def generate_ground_truth(
     unit  = merged.get("unit_number", "—")
     assoc = merged.get("association_name", "The Association")
 
-    owner_last  = owner.split()[-1] if owner not in ("Unknown",) else "Owner"
-    assoc_slug  = "".join(c for c in assoc if c.isalnum())[:12]
+    owner_last  = owner.split()[-1].title() if owner not in ("Unknown",) else "Owner"
+    assoc_slug  = _re.sub(r"[^A-Za-z0-9]", "", assoc.split()[0]) if assoc.split() else "Assoc"
     unit_slug   = unit.replace(" ", "").replace("/", "-")
-    xl_filename = f"{assoc_slug}_{owner_last}_{unit_slug}_GroundTruth_{today_str}.xlsx"
+    xl_filename = f"{assoc_slug}_{owner_last}_{unit_slug}_Ledger_{today_str}.xlsx"
     xl_path     = OUTPUT_DIR / xl_filename
 
     # ── Build the AR ledger rows from the ACTIVE delinquency period ─────

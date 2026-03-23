@@ -24,10 +24,14 @@ export const AIConcierge = () => {
     const handleFileParsed = (e) => {
       const { type, fileName, summary, details, stage, similarity, entities } = e.detail;
       setParsedFiles(prev => [...prev, { type, fileName, summary, details, similarity, entities }]);
+      // Show brief upload confirmation — Claude's real analysis comes via condoclaw:claude_review
+      const owner = entities?.owner_name || 'Detected';
+      const unit = entities?.unit_number || 'Detected';
+      const balance = entities?.total_amount_owed || entities?.balance || 'Pending';
       setMessages(prev => [...prev, {
         id: Date.now().toString(), role: 'ai',
-        text: `### 📄 Document Detected: ${type.toUpperCase()}\n\n**File:** ${fileName}\n\n**AI Summary:** ${summary}\n\n**CondoClaw Memory Match:** \`${similarity || '94.2'}%\`\n\n**NLP Extraction:**\n- **Owner:** ${entities?.owner_name || 'Detected'}\n- **Unit:** ${entities?.unit_number || 'Detected'}\n- **Balance:** $${entities?.balance || 'Calculated'}\n\n**Pipeline Status:** Currently in **Stage ${stage}**. ${details}`,
-        reasoning: 'OCR/NLP analysis complete. Similarity search against CondoClaw Memory confirmed a high-confidence match.',
+        text: `**${type.toUpperCase()} Uploaded:** ${fileName}\n\n**Owner:** ${owner} | **Unit:** ${unit} | **Balance:** $${balance}\n\n${summary || ''}\n\n_Claude is reviewing this document..._`,
+        reasoning: `Document parsed. Extracted ${Object.keys(entities || {}).length} fields. Claude document review triggered.`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       }]);
     };
@@ -51,13 +55,25 @@ export const AIConcierge = () => {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       }]);
     };
+    const handleClaudeReview = (e) => {
+      const { step, message } = e.detail;
+      const stepLabel = step === 1 ? 'Upload Review' : 'Post-Generation Review';
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(), role: 'ai',
+        text: message,
+        reasoning: `Claude Document Intelligence — Step ${step}: ${stepLabel}. FL statute analysis and NOLA-ledger reconciliation complete.`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      }]);
+    };
     window.addEventListener('condoclaw:file_parsed', handleFileParsed);
     window.addEventListener('condoclaw:stage_changed', handleStageChanged);
     window.addEventListener('condoclaw:correction', handleCorrection);
+    window.addEventListener('condoclaw:claude_review', handleClaudeReview);
     return () => {
       window.removeEventListener('condoclaw:file_parsed', handleFileParsed);
       window.removeEventListener('condoclaw:stage_changed', handleStageChanged);
       window.removeEventListener('condoclaw:correction', handleCorrection);
+      window.removeEventListener('condoclaw:claude_review', handleClaudeReview);
     };
   }, []);
 
